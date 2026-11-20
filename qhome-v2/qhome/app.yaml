@@ -1,0 +1,8 @@
+name: QHome
+description: "No-code smart home for the UNO Q: configure every pin, snap Scratch-style blocks together, link other Arduino boards, MQTT and Home Assistant built in"
+icon: 🏠
+ports:
+  - 7000
+  - 1883
+  - 7001
+bricks: []
