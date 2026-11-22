@@ -1,0 +1,17 @@
+{
+  "python.analysis.extraPaths": ["python", "tests"],
+  "python.testing.unittestEnabled": true,
+  "python.testing.pytestEnabled": false,
+  "python.testing.unittestArgs": ["-v", "-s", "tests", "-p", "test_*.py"],
+  "json.schemas": [
+    {
+      "fileMatch": ["/data/config.json", "/data-pc/config.json", "/.demo-data/config.json", "/tests/fixtures/demo/config.json", "*.qhome.json"],
+      "url": "./schema/qhome-config.schema.json"
+    }
+  ],
+  "files.associations": { "*.ino": "cpp" },
+  "files.exclude": { "**/__pycache__": true },
+  "files.readonlyInclude": { "docs/help.*.md": true },
+  "search.exclude": { "assets/vendor": true },
+  "editor.rulers": [110]
+}
