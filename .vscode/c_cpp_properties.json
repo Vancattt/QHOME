@@ -1,0 +1,14 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      // Lets IntelliSense understand the .ino files without the Arduino cores installed,
+      // using the small PC stand-in the firmware tests compile against.
+      "name": "QHome sketches",
+      "includePath": ["${workspaceFolder}/tests/host/mock/unoq", "${workspaceFolder}/tests/host/mock", "${workspaceFolder}/satellite/qhome_satellite"],
+      "forcedInclude": ["${workspaceFolder}/tests/host/mock/Arduino.h"],
+      "defines": ["MOCK_UNOQ"],
+      "cppStandard": "c++17"
+    }
+  ]
+}

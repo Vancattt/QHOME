@@ -1,0 +1,49 @@
+{
+  // Press F5. The browser opens by itself once the web UI is up (serverReadyAction below).
+  // QHOME_OPEN_BROWSER=0 keeps python/main.py from opening a second tab. The demo also pretends
+  // that an ESP32 was found on Wi-Fi, so Boards & pins shows the "New board found" note.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "QHome: simulator (demo setup, 3 simulated boards)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/python/main.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "preLaunchTask": "QHome: prepare demo data",
+      "env": { "QHOME_MODE": "sim", "QHOME_DATA": "${workspaceFolder}/.demo-data", "QHOME_OPEN_BROWSER": "0",
+               "QHOME_SIM_DISCOVER": "esp32@wifi:porch" },
+      "serverReadyAction": { "pattern": "Web UI ready on port ([0-9]+)", "uriFormat": "http://localhost:%s", "action": "openExternally" }
+    },
+    {
+      "name": "QHome: simulator (empty setup)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/python/main.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": { "QHOME_MODE": "sim", "QHOME_DATA": "${workspaceFolder}/data", "QHOME_OPEN_BROWSER": "0" },
+      "serverReadyAction": { "pattern": "Web UI ready on port ([0-9]+)", "uriFormat": "http://localhost:%s", "action": "openExternally" }
+    },
+    {
+      "name": "QHome: this PC as the hub (real USB and Wi-Fi boards)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/python/main.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": { "QHOME_MODE": "pc", "QHOME_DATA": "${workspaceFolder}/data-pc", "QHOME_OPEN_BROWSER": "0" },
+      "serverReadyAction": { "pattern": "Web UI ready on port ([0-9]+)", "uriFormat": "http://localhost:%s", "action": "openExternally" }
+    },
+    {
+      "name": "QHome: run the tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "unittest",
+      "args": ["discover", "-s", "tests", "-p", "test_*.py"],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

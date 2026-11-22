@@ -1,0 +1,107 @@
+{
+  // Terminal > Run Task. The UNO Q tasks need SSH enabled on the board; the Arduino
+  // tasks need arduino-cli on this computer (https://arduino.github.io/arduino-cli).
+  // The ESP boards also need their cores: esp32:esp32 and esp8266:esp8266 (Boards Manager URLs in
+  // the Help page "Board models" and in docs/help.en.md).
+  "version": "2.0.0",
+  "inputs": [
+    { "id": "unoq", "type": "promptString", "description": "UNO Q login (user@host)", "default": "arduino@uno-q.local" },
+    { "id": "port", "type": "promptString", "description": "Serial port of the satellite board (COM5, /dev/ttyACM0, ...)" },
+    {
+      "id": "fqbn", "type": "pickString", "description": "Satellite board",
+      "options": ["arduino:avr:uno", "arduino:avr:nano", "arduino:avr:nano:cpu=atmega328old", "arduino:avr:mega",
+                  "arduino:renesas_uno:minima", "arduino:renesas_uno:unor4wifi", "arduino:renesas_uno:nanor4",
+                  "esp32:esp32:esp32doit-devkit-v1", "esp32:esp32:nologo_esp32c3_super_mini",
+                  "esp8266:esp8266:nodemcuv2"],
+      "default": "arduino:avr:uno"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "QHome: prepare demo data",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-c", "import os,shutil; os.makedirs('.demo-data',exist_ok=True); os.path.exists('.demo-data/config.json') or shutil.copy('tests/fixtures/demo/config.json','.demo-data/config.json')"],
+      "presentation": { "reveal": "silent" },
+      "problemMatcher": []
+    },
+    {
+      "label": "QHome: run the simulator",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["python/main.py"],
+      "options": { "env": { "QHOME_MODE": "sim" } },
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "QHome: run the tests",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "QHome: regenerate the setup schema",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["tools/gen_schema.py"],
+      "problemMatcher": []
+    },
+    {
+      "label": "QHome: regenerate the docs",
+      "detail": "Writes docs/help.en.md and docs/help.tr.md from assets/help.js. Run it after editing the help.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["tools/gen_docs.py"],
+      "problemMatcher": []
+    },
+    {
+      "label": "UNO Q: deploy the app",
+      "detail": "Copies the app to ~/ArduinoApps/qhome on the board. Your setup in data/ on the board is left alone.",
+      "type": "shell",
+      "command": "ssh ${input:unoq} \"mkdir -p ArduinoApps/qhome\" && scp -r app.yaml python sketch assets tools ${input:unoq}:ArduinoApps/qhome/",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "UNO Q: restart the app",
+      "type": "shell",
+      "command": "ssh ${input:unoq} \"arduino-app-cli app stop /home/arduino/ArduinoApps/qhome; arduino-app-cli app start /home/arduino/ArduinoApps/qhome\"",
+      "problemMatcher": []
+    },
+    {
+      "label": "UNO Q: show the app log",
+      "type": "shell",
+      "command": "ssh ${input:unoq} \"arduino-app-cli app logs /home/arduino/ArduinoApps/qhome\"",
+      "problemMatcher": []
+    },
+    {
+      "label": "UNO Q: install the USB helper service",
+      "detail": "Needed once so QHome inside App Lab can reach boards on USB.",
+      "type": "shell",
+      "command": "ssh ${input:unoq} \"mkdir -p ~/.config/systemd/user && cp ~/ArduinoApps/qhome/tools/qhome-usb-helper.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now qhome-usb-helper && systemctl --user --no-pager status qhome-usb-helper\"",
+      "problemMatcher": []
+    },
+    {
+      "label": "Satellite: compile",
+      "type": "shell",
+      "command": "arduino-cli compile --fqbn ${input:fqbn} satellite/qhome_satellite",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Satellite: compile and upload",
+      "type": "shell",
+      "command": "arduino-cli compile --upload -p ${input:port} --fqbn ${input:fqbn} satellite/qhome_satellite",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Master sketch: compile check",
+      "detail": "Needs the arduino:zephyr core and the Arduino_RouterBridge library on this computer.",
+      "type": "shell",
+      "command": "arduino-cli compile --fqbn arduino:zephyr:unoq sketch",
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}
