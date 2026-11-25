@@ -80,8 +80,8 @@ export function DeviceCard({ component, board, boardState, state, definition, co
       {component.type === "binary_input" && <div className="device-reading">
         <span className={`reading-lamp ${value ? "lamp-on" : ""}`} />
         <strong>{value == null ? "—" : value ? t("on") : t("off")}</strong>
-        {simulated && <button className="small-button" onPointerDown={() => {
-          const press = (held: boolean) => api.simulateInput(component.board, component.pin, held ? (props.invert ? 0 : 1) : (props.invert ? 1 : 0)).catch(error => commandError(error, onCommandError, language));
+        {simulated && component.board !== null && <button className="small-button" onPointerDown={() => {
+          const press = (held: boolean) => api.simulateInput(component.board ?? "", component.pin, held ? (props.invert ? 0 : 1) : (props.invert ? 1 : 0)).catch(error => commandError(error, onCommandError, language));
           void press(true);
           const release = () => { void press(false); };
           window.addEventListener("pointerup", release, { once: true });

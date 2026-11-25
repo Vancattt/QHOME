@@ -13,7 +13,7 @@ export interface ComponentConfig {
   id: string;
   type: DeviceType;
   name: string;
-  board: string;
+  board: string | null;
   pin?: string | number;
   props?: Record<string, unknown>;
 }
@@ -25,10 +25,21 @@ export interface BoardConfig {
   link?: { type?: string; [key: string]: unknown };
 }
 
+export interface ModelPin { id: string | number; label: string; alt?: string; caps: string[]; notes: string[]; }
+export interface BoardHeader { name?: string; side?: string; x: number; y: number; cols?: number; pins: Array<string | number | { pad?: string; same?: string | number }>; }
+export interface BoardPart { type: string; x: number; y: number; w?: number; h?: number; label?: string; pin?: string | number; cols?: number; rows?: number; }
+export interface BoardFootprint { w: number; h: number; headers?: BoardHeader[]; parts?: BoardPart[]; }
+export interface DiscoveredBoard { key: string; link: "usb" | "wifi"; id?: string; port?: string; model?: string | null; proto?: string | null; boot?: string | null; t?: number; }
+export interface SerialPortInfo { name: string; busy?: boolean; }
+export interface ConfigSaveResult { ok: boolean; errors?: string[]; restart?: boolean; }
+
 export interface QHomeConfig {
-  device: { name?: string; node?: string; role?: "master" | "node"; master_host?: string };
+  device: { name?: string; node?: string; role?: "master" | "node"; master_host?: string; [key: string]: unknown };
   boards: BoardConfig[];
   components: ComponentConfig[];
+  mqtt?: Record<string, unknown>;
+  scripts?: { workspace?: Record<string, unknown>; [key: string]: unknown };
+  [key: string]: unknown;
 }
 
 export interface DeviceState {
@@ -62,6 +73,7 @@ export interface DashboardSnapshot {
   mqtt?: { mode?: string; ok?: boolean; text?: string };
   matrix?: Record<string, string>;
   mx?: Record<string, { mode?: string; auto?: boolean; left?: number }>;
+  discovered?: DiscoveredBoard[];
   vars?: Record<string, unknown>;
   running?: number;
   uptime?: number;
@@ -84,6 +96,16 @@ export interface DeviceTypeDefinition {
 
 export interface BoardModel {
   label?: string;
+  pins: ModelPin[];
+  links: string[];
+  layout?: Array<[string, Array<string | number>]>;
+  board?: BoardFootprint | null;
+  serial_pins?: Array<string | number>;
+  uart_pins?: Array<string | number>;
+  i2c_pins?: Array<string | number>;
+  usb_shares_uart?: boolean;
+  logic?: number;
+  adc_max?: number;
   vref?: number;
 }
 
