@@ -17,8 +17,16 @@ import re
 import threading
 import time
 
-# Pin modes, identical in sketch/sketch.ino and satellite/qhome_satellite
-M_OFF, M_DIN, M_DIN_PU, M_DIN_PD, M_DOUT, M_PWM, M_ADC, M_DAC, M_CNT = range(9)
+# Pin modes, identical in sketch/sketch.ino and satellite/qhome_satellite. 9-11 are satellite only:
+# M_SERVO  "A <pin> <degrees>" moves it          M_DHT  reports "T <pin> <temp x10> <hum x10>"
+# M_NFC    the CS pin of an RC522 reader on the board's SPI; reports "N <pin> <card id>"
+M_OFF, M_DIN, M_DIN_PU, M_DIN_PD, M_DOUT, M_PWM, M_ADC, M_DAC, M_CNT, M_SERVO, M_DHT, M_NFC = range(12)
+UID_RE = re.compile(r"^[0-9A-F]{8}(?:[0-9A-F]{6})?(?:[0-9A-F]{6})?$")   # 4, 7 or 10 byte card ids
+
+
+def dht_event(t10, h10):
+    """A DHT reading as it travels to the engine: ("dht", temperature, humidity) or ("dht", None)."""
+    return ("dht", t10 / 10.0, h10 / 10.0)
 
 RGB_BITS = {"off": 0, "red": 1, "green": 2, "yellow": 3, "blue": 4,
             "magenta": 5, "cyan": 6, "white": 7}
@@ -140,6 +148,7 @@ class SimHW:
         self.modes, self.cfg, self.din, self.out, self.cnt, self.last_rep = {}, {}, {}, {}, {}, {}
         self.matrix_frame = "0" * 104
         self.leds = {}
+        self.servo = {}           # pin -> last angle written
         self.t0 = time.time()
         self._lock = threading.Lock()
 
@@ -153,6 +162,8 @@ class SimHW:
             self.last_rep[pin] = 0
             if mode == M_CNT:
                 self.cnt[pin] = 0
+            if mode == M_DHT:
+                self.last_rep[pin] = time.time() - interval / 1000.0 + 0.3   # first reading soon
             if mode in (M_DIN, M_DIN_PU, M_DIN_PD):
                 self.din[pin] = 1 if mode == M_DIN_PU else 0
                 self.on_event(pin, self.din[pin])
@@ -164,6 +175,8 @@ class SimHW:
 
     def write_analog(self, pin, v12):
         self.out[pin] = v12
+        if self.modes.get(pin) == M_SERVO:
+            self.servo[pin] = v12
         return v12
 
     def rgb(self, led, bits):
@@ -194,6 +207,12 @@ class SimHW:
 
     def sim_input(self, pin, value):
         with self._lock:
+            if self.modes.get(pin) == M_NFC:            # value: the card id to "hold to the reader"
+                uid = re.sub(r"[^0-9A-Fa-f]", "", str(value or "")).upper()
+                if not UID_RE.match(uid):
+                    return False
+                self.on_event(pin, ("nfc", uid))
+                return True
             if self.modes.get(pin) in (M_DIN, M_DIN_PU, M_DIN_PD):
                 self.din[pin] = 1 if value else 0
                 self.on_event(pin, self.din[pin])
@@ -204,12 +223,17 @@ class SimHW:
         now = now or time.time()
         with self._lock:
             for pin, mode in list(self.modes.items()):
-                if mode not in (M_ADC, M_CNT):
+                if mode not in (M_ADC, M_CNT, M_DHT):
                     continue
                 if now - self.last_rep.get(pin, 0) < self.cfg.get(pin, 1000) / 1000.0:
                     continue
                 self.last_rep[pin] = now
-                if mode == M_ADC:
+                if mode == M_DHT:                       # a room that warms and dries slowly
+                    ph = (now - self.t0) / 60.0 + pin
+                    t10 = int(round(240 + 30 * math.sin(ph) + random.uniform(-1, 1)))
+                    h10 = int(round(450 - 80 * math.sin(ph) + random.uniform(-3, 3)))
+                    self.on_event(pin, dht_event(t10, h10))
+                elif mode == M_ADC:
                     base = 0.5 + 0.35 * math.sin((now - self.t0) / 20.0 + pin)
                     raw = (base + random.uniform(-0.01, 0.01)) * self.adc_max
                     self.on_event(pin, int(max(0, min(self.adc_max, raw))))
@@ -260,6 +284,15 @@ class QLinkHW:
         try:
             if k == "E" and len(parts) >= 3:
                 self.on_event(int(parts[1]), int(parts[2]))
+            elif k == "T" and len(parts) >= 3:        # DHT: "T <pin> <t x10> <h x10>" or "T <pin> e"
+                if parts[2] == "e" or len(parts) < 4:
+                    self.on_event(int(parts[1]), ("dht", None, None))
+                else:
+                    self.on_event(int(parts[1]), dht_event(int(parts[2]), int(parts[3])))
+            elif k == "N" and len(parts) >= 3:        # NFC card held to the reader
+                uid = parts[2].upper()
+                if UID_RE.match(uid):
+                    self.on_event(int(parts[1]), ("nfc", uid))
             elif k == "h" and len(parts) >= 4:
                 boot = parts[3]
                 fresh = not self.connected or boot != self.boot_id
@@ -330,7 +363,15 @@ class QLinkDevice:
         self.boot_id = "%04x" % random.randint(0, 0xFFFF)
 
     def event(self, pin, val):
-        self.send("E %d %d" % (pin, val))
+        if isinstance(val, tuple) and val[0] == "dht":
+            if val[1] is None:
+                self.send("T %d e" % pin)
+            else:
+                self.send("T %d %d %d" % (pin, round(val[1] * 10), round(val[2] * 10)))
+        elif isinstance(val, tuple) and val[0] == "nfc":
+            self.send("N %d %s" % (pin, val[1]))
+        else:
+            self.send("E %d %d" % (pin, val))
 
     def rebooted(self):
         self.boot_id = "%04x" % random.randint(0, 0xFFFF)

@@ -796,7 +796,7 @@ class SerialMonitorInfo(unittest.TestCase):
         self.assertEqual(hw.info_text, "x")
         text = qh_sys.monitor_text(qh_engine.VERSION, "QHome Demo", ["192.168.1.50"], 7000, 1883)
         self.assertEqual(hw.info(text), len(text))
-        self.assertEqual(hw.info_text.split("\n"), ["QHome 2.1.0 (QHome Demo)", "http://192.168.1.50:7000",
+        self.assertEqual(hw.info_text.split("\n"), ["QHome %s (QHome Demo)" % qh_engine.VERSION, "http://192.168.1.50:7000",
                                                     "MQTT 192.168.1.50:1883"])
 
     def test_local_needs_firmware_5(self):
@@ -1732,11 +1732,11 @@ class WebApi(unittest.TestCase):
         for k in ("role", "sim", "has_local", "link_port", "types", "models", "colors", "version", "entity_fields",
                   "web_port", "sys", "matrix", "tz"):
             self.assertIn(k, m)
-        self.assertEqual((m["version"], m["web_port"]), ("2.1.0", self.port))
+        self.assertEqual((m["version"], m["web_port"]), (qh_engine.VERSION, self.port))
         self.assertEqual(list(m["models"]), list(qh_boards.MODELS))
         self.assertEqual(m["models"]["esp32"]["uart_pins"], [16, 17])
         self.assertEqual(m["models"]["unoq"]["board"]["w"], 27)
-        self.assertEqual(m["models"]["esp8266"]["pins"][0], {"id": 16, "label": "D0", "caps": ["din", "dout"],
+        self.assertEqual(m["models"]["esp8266"]["pins"][0], {"id": 16, "label": "D0", "caps": ["din", "dout", "dht", "nfc"],
                                                              "notes": ["no_pullup"], "alt": "GPIO16"})
         self.assertEqual(m["matrix"]["modes"], list(font.MODES))
         self.assertEqual(m["matrix"]["anims"], list(font.ANIMS))
@@ -2384,6 +2384,205 @@ class Schema(unittest.TestCase):
                   if v["if"]["properties"]["type"]["const"] == "led_matrix")["then"]["properties"]["props"]["properties"]
         self.assertEqual(mx["mode"], {"enum": list(font.MODES), "default": "text"})
         self.assertEqual(mx["source"], {"type": "string", "default": ""})
+
+
+
+# ---------------------------------------------------------------- servo, DHT, NFC (satellite parts)
+def parts_config():
+    """Demo setup plus a servo, a DHT22 and an NFC reader on the simulated UNO R3 'garage'."""
+    cfg = demo_config(with_scripts=False)
+    cfg["components"] += [
+        {"id": "door", "type": "servo", "name": "Door", "board": "garage", "pin": 6, "props": {"open_angle": 100}},
+        {"id": "climate", "type": "dht_sensor", "name": "Climate", "board": "garage", "pin": 5,
+         "props": {"interval": 2000, "temp_offset": -0.5}},
+        {"id": "reader", "type": "nfc_reader", "name": "Front door", "board": "garage", "pin": 10,
+         "props": {"cards": [{"uid": "04:a3:1f:b2", "name": "Burak"}]}}]
+    return cfg
+
+
+def blocks(*chains):
+    return {"blocks": {"languageVersion": 0, "blocks": list(chains)},
+            "variables": [{"name": "who", "id": "vw"}, {"name": "n", "id": "vn"}]}
+
+
+def stack(*bl):
+    first = dict(bl[0])
+    cur = first
+    for b in bl[1:]:
+        nb = dict(b)
+        cur["next"] = {"block": nb}
+        cur = nb
+    return first
+
+
+class Parts(unittest.TestCase):
+    def rig(self, cfg):
+        r = Rig(cfg)
+        self.addCleanup(r.close)
+        self.assertTrue(r.wait(lambda: r.engine.online.get("garage"), 5), "simulated satellite online")
+        return r
+
+    def test_models_offer_the_parts_on_satellites_only(self):
+        uno, unoq, esp8266 = (qh_boards.model(k) for k in ("uno", "unoq", "esp8266"))
+        self.assertTrue({"servo", "dht", "nfc"} <= set(uno["pin_by_id"][6]["caps"]))
+        self.assertNotIn("nfc", uno["pin_by_id"][11]["caps"])                     # SPI pins carry the reader
+        self.assertIn("servo_timer", uno["pin_by_id"][9]["notes"])
+        self.assertFalse(any(k in p["caps"] for p in unoq["pins"] for k in ("servo", "dht", "nfc")))
+        self.assertNotIn("servo", esp8266["pin_by_id"][16]["caps"])
+        self.assertFalse(any("servo" in p["caps"] for p in qh_boards.model("esp32")["pins"] if p["id"] >= 34))
+
+    def test_validation(self):
+        cfg = parts_config()
+        self.assertEqual(qh_engine.validate(cfg), [])
+        bad = clone(cfg)
+        bad["components"].append({"id": "spi", "type": "switch_output", "name": "Spi", "board": "garage", "pin": 13, "props": {}})
+        self.assertTrue(any("NFC reader (SPI)" in e for e in qh_engine.validate(bad)))
+        bad = clone(cfg)
+        bad["components"].append({"id": "r2", "type": "nfc_reader", "name": "R2", "board": "garage", "pin": 9, "props": {}})
+        self.assertTrue(any("at most 1 NFC reader" in e for e in qh_engine.validate(bad)))
+        bad = clone(cfg)
+        bad["components"] += [{"id": "s%d" % i, "type": "servo", "name": "S", "board": "garage", "pin": p, "props": {}}
+                              for i, p in enumerate((2, 3, 8, 11, 12, 15))]
+        bad["components"] = [c for c in bad["components"] if c["id"] != "reader"]
+        self.assertTrue(any("at most 6 servos" in e for e in qh_engine.validate(bad)))
+        bad = clone(cfg)
+        bad["components"].append({"id": "dim", "type": "pwm_output", "name": "Dim", "board": "garage", "pin": 9, "props": {}})
+        self.assertTrue(any("dimming does not work on pin D9" in e for e in qh_engine.validate(bad)))
+        bad = clone(cfg)
+        bad["components"][-1]["props"]["cards"] = [{"uid": "XYZ", "name": "a"}, {"uid": "04A31FB2"}, {"uid": "04 A3 1F B2"}]
+        errs = qh_engine.validate(bad)
+        self.assertTrue(any("'XYZ' is not valid" in e for e in errs) and any("listed twice" in e for e in errs), errs)
+        bad = clone(cfg)
+        bad["components"].append({"id": "dq", "type": "servo", "name": "Q", "board": "main", "pin": 6, "props": {}})
+        self.assertTrue(any("cannot do that" in e for e in qh_engine.validate(bad)), "not on the UNO Q's own pins")
+
+    def test_servo_commands(self):
+        r = self.rig(parts_config())
+        e, sim = r.engine, r.engine.transports["garage"].sim
+        self.assertTrue(r.wait(lambda: sim.modes.get(6) == qh_hw.M_SERVO))
+        self.assertTrue(r.wait(lambda: sim.servo.get(6) == 0), "starts closed")
+        for action, value, want in (("open", None, 100), ("close", None, 0), ("toggle", None, 100), ("toggle", None, 0),
+                                    ("set", 45, 45), ("set", 999, 180), ("set", "open", 100), ("set", "CLOSE", 0),
+                                    ("on", None, 100), ("off", None, 0)):
+            e.submit_command("door", action, value)
+            self.assertTrue(r.wait(lambda: sim.servo.get(6) == want), (action, value, want, sim.servo.get(6)))
+            self.assertEqual(r.state("door"), want)
+        self.assertEqual(e.fmt_value("door"), "0")
+
+    def test_dht_reading_and_humidity(self):
+        r = self.rig(parts_config())
+        self.assertTrue(r.wait(lambda: r.state("climate") is not None, 5), "first DHT reading")
+        e = r.engine
+        snap = e.snapshot()["states"]["climate"]
+        self.assertIsInstance(snap["v"], float)
+        self.assertIsInstance(snap["h"], float)
+        self.assertTrue(0 <= snap["h"] <= 100 and 10 < snap["v"] < 35, snap)
+        c = e.comps()["climate"]
+        e._dht_reading(c, qh_engine.props_of(c), 25.0, 61.04)            # offset -0.5, one decimal
+        self.assertEqual((r.state("climate"), e.humidity_of("climate")), (24.5, 61.0))
+        for _ in range(3):
+            e._dht_reading(c, qh_engine.props_of(c), None, None)
+        self.assertIsNone(r.state("climate"), "three missed readings: no value")
+        self.assertTrue(any("does not answer" in x["msg"] for x in e.logs))
+
+    def test_qlink_lines(self):
+        seen = []
+        hw = qh_hw.QLinkHW("x", lambda pin, val: seen.append((pin, val)), lambda b: None, lambda *a: None)
+        for line in ("T 4 235 481", "T 4 -52 905", "T 4 e", "N 10 04a31fb2", "N 10 04112233445566", "N 10 zz", "N 10 123"):
+            hw.feed(line)
+        self.assertEqual(seen, [(4, ("dht", 23.5, 48.1)), (4, ("dht", -5.2, 90.5)), (4, ("dht", None, None)),
+                                (10, ("nfc", "04A31FB2")), (10, ("nfc", "04112233445566"))])
+        out = []
+        dev = qh_hw.QLinkDevice(qh_hw.SimHW(lambda *a: None), "uno", out.append)
+        dev.event(4, ("dht", 23.5, 48.1))
+        dev.event(4, ("dht", None, None))
+        dev.event(10, ("nfc", "04A31FB2"))
+        dev.event(3, 1)
+        self.assertEqual(out, ["T 4 235 481", "T 4 e", "N 10 04A31FB2", "E 3 1"])
+
+    def test_cards_and_scripts(self):
+        cfg = parts_config()
+        get_name = {"type": "get_card", "fields": {"WHAT": "name"}}
+        cfg["scripts"] = {"workspace": blocks(
+            stack({"type": "ev_card", "id": "k", "fields": {"ENT": "reader", "WHICH": "known"}},
+                  {"type": "do_servo", "id": "o", "fields": {"ENT": "door", "DO": "open"}},
+                  {"type": "variables_set", "id": "vs", "fields": {"VAR": {"id": "vw"}}, "inputs": {"VALUE": {"block": get_name}}}),
+            stack({"type": "ev_card", "id": "u", "fields": {"ENT": "reader", "WHICH": "unknown"}},
+                  {"type": "math_change", "id": "mc", "fields": {"VAR": {"id": "vn"}}, "inputs": {"DELTA": {"shadow": {"type": "math_number", "fields": {"NUM": 1}}}}}),
+            stack({"type": "ev_hum", "id": "hh", "fields": {"ENT": "climate", "OP": "above"},
+                   "inputs": {"VALUE": {"shadow": {"type": "math_number", "fields": {"NUM": 80}}}}},
+                  {"type": "do_turn", "id": "t1", "fields": {"ENT": "relay", "TO": "on"}}))}
+        self.assertEqual(qh_engine.validate(cfg), [])
+        r = self.rig(cfg)
+        e = r.engine
+        self.assertTrue(r.wait(lambda: e.transports["garage"].sim.modes.get(10) == qh_hw.M_NFC))
+        self.assertTrue(e.sim_input("garage", 10, "0499aabb"))
+        self.assertTrue(r.wait(lambda: r.state("reader") == "0499AABB"))
+        self.assertTrue(r.wait(lambda: e.scripts.variables().get("n") == "1"), "the unknown-card script ran")
+        self.assertEqual(r.state("door"), 0, "an unknown card opens nothing")
+        self.assertTrue(e.sim_input("garage", 10, "04 A3 1F B2"))
+        self.assertTrue(r.wait(lambda: r.state("door") == 100), "a known card opens the door")
+        self.assertTrue(r.wait(lambda: e.scripts.variables().get("who") == "Burak"))
+        last = e.snapshot()["states"]["reader"]["card"]
+        self.assertEqual((last["uid"], last["name"], last["known"]), ("04A31FB2", "Burak", True))
+        self.assertTrue(any("Card 'Burak' (04A31FB2) scanned on Front door" in x["msg"] for x in e.logs))
+        self.assertFalse(e.sim_input("garage", 10, "not a card"))
+        e.post(("hw", "garage", 5, ("dht", 20.0, 50.0)))
+        self.assertTrue(r.wait(lambda: e.humidity_of("climate") == 50.0))
+        self.assertFalse(r.state("relay"))
+        e.post(("hw", "garage", 5, ("dht", 20.0, 85.0)))             # only the humidity rises
+        self.assertTrue(r.wait(lambda: r.state("relay") is True), "humidity above 80 switched the relay")
+        wiggle = blocks(stack({"type": "ev_start", "id": "s"}, {"type": "do_servo", "id": "x", "fields": {"ENT": "door", "DO": "wiggle"}}))
+        self.assertTrue(any("unknown servo action" in x for x in qh_script.validate(wiggle, e.comps(), e.boards())))
+        bad = blocks(stack({"type": "ev_start", "id": "s"}, {"type": "do_servo", "id": "x", "fields": {"ENT": "climate", "DO": "open"}}))
+        self.assertTrue(qh_script.validate(bad, e.comps(), e.boards()), "a DHT is not a servo")
+
+    def test_mqtt_and_home_assistant(self):
+        port = 18977
+        self.r = r = start_master(parts_config(), port)
+        self.addCleanup(r.close)
+        obs = Observer(port, "qhome/#", "homeassistant/#")
+        self.addCleanup(obs.close)
+        self.assertTrue(r.wait(lambda: r.engine.online.get("garage"), 5))
+        self.assertTrue(r.wait(lambda: "homeassistant/sensor/qhome/climate_humidity/config" in obs.seen, 8))
+        hum = json.loads(obs.seen["homeassistant/sensor/qhome/climate_humidity/config"])
+        self.assertEqual((hum["state_topic"], hum["device_class"], hum["unit_of_measurement"]), ("qhome/climate/humidity", "humidity", "%"))
+        tmp = json.loads(obs.seen["homeassistant/sensor/qhome/climate/config"])
+        self.assertEqual(tmp["device_class"], "temperature")
+        srv = json.loads(obs.seen["homeassistant/number/qhome/door/config"])
+        self.assertEqual((srv["min"], srv["max"], srv["command_topic"]), (0, 180, "qhome/door/set"))
+        rd = json.loads(obs.seen["homeassistant/sensor/qhome/reader/config"])
+        self.assertEqual(rd["json_attributes_topic"], "qhome/reader/scan")
+        obs.mq.publish("qhome/door/set", "OPEN")
+        self.assertTrue(r.wait(lambda: obs.seen.get("qhome/door/state") == "100"))
+        obs.mq.publish("qhome/door/set", "37")
+        self.assertTrue(r.wait(lambda: obs.seen.get("qhome/door/state") == "37"))
+        self.assertTrue(r.wait(lambda: obs.seen.get("qhome/climate/humidity") is not None, 6), "humidity is published")
+        r.engine.sim_input("garage", 10, "04A31FB2")
+        self.assertTrue(r.wait(lambda: obs.seen.get("qhome/reader/state") == "Burak"))
+        self.assertTrue(r.wait(lambda: "qhome/reader/scan" in obs.seen))
+        self.assertEqual(json.loads(obs.seen["qhome/reader/scan"]), {"uid": "04A31FB2", "name": "Burak", "known": True})
+
+    def test_restore_servo_position(self):
+        cfg = parts_config()
+        cfg["components"][-3]["props"]["restore"] = "restore"
+        r = Rig(cfg)
+        e = r.engine
+        r.wait(lambda: e.online.get("garage"), 5)
+        e.submit_command("door", "set", 60)
+        self.assertTrue(r.wait(lambda: r.state("door") == 60))
+        def saved():
+            try:
+                with open(os.path.join(r.dir, "state.json")) as f:
+                    return json.load(f).get("door")
+            except (OSError, ValueError):
+                return None
+        self.assertTrue(r.wait(lambda: saved() == 60, 5))
+        r.close()
+        again = qh_engine.Engine(r.dir)
+        again.load_config(True)
+        again._init_states()
+        self.assertEqual(again.state["door"], 60.0)
 
 
 if __name__ == "__main__":

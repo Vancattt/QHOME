@@ -39,7 +39,10 @@ FLAGS = {
 }
 
 
-def build(name, flags=(), config=None, master=False, run=False, expect_error=None):
+LIBS = os.path.join(MOCK, "libs")   # stand-ins for Servo, ESP32Servo, SPI and MFRC522
+
+
+def build(name, flags=(), config=None, master=False, run=False, expect_error=None, libs=True):
     """Compile a sketch against the mock. Satellite: returns the program. Master: syntax check
     only, or with run=True a program driven by tests/host/mock/master_main.cpp.
     expect_error: the build must fail and the compiler output must contain this text."""
@@ -60,6 +63,8 @@ def build(name, flags=(), config=None, master=False, run=False, expect_error=Non
         with open(os.path.join(d, "config.h"), "w") as o:
             o.write(text)
     inc = ["-I" + os.path.join(MOCK, "unoq")] if master else []
+    if libs and not master:
+        inc.append("-I" + LIBS)
     cmd = [GXX, "-std=c++17", "-Wall", "-Werror", "-Wno-unused-function", *flags, *inc, "-I" + MOCK, "-I" + d,
            os.path.join(d, "sketch.cpp")]
     if master and not run:
@@ -789,6 +794,160 @@ class Firmware(unittest.TestCase):
             e.submit_command("pump", "on")
             self.assertTrue(board.wrote("DW 5 1", 3))
             self.assertEqual(board.bad(), [], "no call that would crash the real chip")
+        finally:
+            os.environ.pop("QHOME_REAL_LINKS", None)
+            helper.kill()
+            helper.wait()
+            board.close()
+            rig.close()
+            os.close(master_fd)
+            os.close(slave_fd)
+
+
+
+class Parts(unittest.TestCase):
+    """Servo, DHT11/22 and RC522 NFC on the satellite (QLink modes 9, 10, 11)."""
+
+    def setUp(self):
+        if not GXX:
+            self.skipTest("g++ not found")
+
+    def test_servo(self):
+        for name, flags, pin in (("uno", [], 6), ("r4w", ["-DARDUINO_UNOR4_WIFI"], 5),
+                                 ("esp32", FLAGS["esp32"], 13), ("esp8266", FLAGS["esp8266"], 14)):
+            b = Board(build(name + "-parts", flags=flags))
+            try:
+                b.expect("B ")
+                self.assertEqual(b.ask("C %d 9 0 0" % pin), "c %d 9" % pin, name)
+                self.assertTrue(b.wrote("SA %d" % pin), name)
+                b.send("A %d 90" % pin)
+                self.assertTrue(b.wrote("SW %d 90" % pin), "%s: the angle reaches the servo" % name)
+                b.send("A %d 4000" % pin)                   # out of range: held at 180
+                self.assertTrue(b.wrote("SW %d 180" % pin), name)
+                self.assertEqual(b.ask("C %d 4 0 0" % pin), "c %d 4" % pin)   # another job: servo let go
+                self.assertTrue(b.wrote("SD %d" % pin), name)
+                self.assertEqual(b.bad(), [], name)
+            finally:
+                b.close()
+
+    def test_servo_slots_and_refusals(self):
+        b = Board(build("uno-parts"))
+        try:
+            b.expect("B ")
+            for p in (2, 3, 4, 5, 6, 7):                    # six servos per board
+                self.assertEqual(b.ask("C %d 9 0 0" % p), "c %d 9" % p)
+            self.assertEqual(b.ask("C 8 9 0 0"), "c 8 -3")  # a seventh: no slot left
+            self.assertEqual(b.ask("C 7 0 0 0"), "c 7 0")   # one freed
+            self.assertEqual(b.ask("C 8 9 0 0"), "c 8 9")
+            self.assertEqual(b.ask("C 0 9 0 0"), "c 0 -1")  # the serial link pin
+        finally:
+            b.close()
+        nolib = Board(build("uno-nolib", libs=False))      # without the libraries: refused, still builds
+        try:
+            nolib.expect("B ")
+            self.assertEqual(nolib.ask("C 6 9 0 0"), "c 6 -2")
+            self.assertEqual(nolib.ask("C 10 11 150 0"), "c 10 -2")
+            self.assertEqual(nolib.ask("C 4 10 2000 22"), "c 4 10")   # DHT needs no library
+        finally:
+            nolib.close()
+        e8 = Board(build("esp8266-parts", flags=FLAGS["esp8266"]))
+        try:
+            e8.expect("B ")
+            self.assertEqual(e8.ask("C 16 9 0 0"), "c 16 -2")   # GPIO16 has no timer output
+        finally:
+            e8.close()
+
+    def _dht(self, name, flags, pin, kind, t10, h10, expect):
+        b = Board(build(name + "-parts", flags=flags))
+        try:
+            b.expect("B ")
+            b.send("~h %d %d %d" % (pin, t10, h10))
+            self.assertEqual(b.ask("C %d 10 2000 %d" % (pin, kind)), "c %d 10" % pin)
+            line = b.expect("T %d" % pin, timeout=4)
+            self.assertEqual(line, expect, name)
+            self.assertEqual(b.bad(), [], name)
+        finally:
+            b.close()
+
+    def test_dht22(self):
+        self._dht("uno", [], 4, 22, 235, 481, "T 4 235 481")
+        self._dht("esp32", FLAGS["esp32"], 27, 22, -52, 905, "T 27 -52 905")    # below zero
+        self._dht("nanor4", FLAGS["nanor4"], 7, 22, 300, 0, "T 7 300 0")
+
+    def test_dht11(self):
+        # DHT11 sends whole numbers in the first byte of each pair: humidity 40 %, 22 degrees
+        self._dht("uno", [], 5, 11, (22 << 8) | 0, (40 << 8) | 0, "T 5 220 400")
+
+    def test_dht_that_does_not_answer(self):
+        self._dht("uno", [], 4, 22, -1000, 0, "T 4 e")
+
+    def test_nfc(self):
+        for name, flags, cs, spi in (("uno", [], 10, (11, 12, 13)), ("esp32", FLAGS["esp32"], 5, (23, 19, 18)),
+                                     ("esp8266", FLAGS["esp8266"], 15, (13, 12, 14)),
+                                     ("r4w", ["-DARDUINO_UNOR4_WIFI"], 10, (11, 12, 13))):
+            b = Board(build(name + "-parts", flags=flags))
+            try:
+                b.expect("B ")
+                self.assertEqual(b.ask("C %d 11 150 0" % cs), "c %d 11" % cs, name)
+                self.assertTrue(b.wrote("NI %d 255" % cs), name)
+                b.send("~n 04A31FB2")
+                self.assertEqual(b.expect("N %d" % cs), "N %d 04A31FB2" % cs, name)
+                b.send("~n 04112233445566")                  # a 7-byte card (NTAG sticker)
+                self.assertEqual(b.expect("N %d" % cs), "N %d 04112233445566" % cs, name)
+                for p in spi:                                # MOSI, MISO, SCK belong to the reader now
+                    self.assertEqual(b.ask("C %d 4 0 0" % p), "c %d -1" % p, (name, p))
+                self.assertEqual(b.bad(), [], name)
+            finally:
+                b.close()
+
+    def test_nfc_one_reader_and_release(self):
+        b = Board(build("uno-parts"))
+        try:
+            b.expect("B ")
+            self.assertEqual(b.ask("C 10 11 150 0"), "c 10 11")
+            self.assertEqual(b.ask("C 9 11 150 0"), "c 9 -3")   # one reader per board
+            self.assertEqual(b.ask("C 10 0 0 0"), "c 10 0")     # released: SPI pins free again
+            self.assertTrue(b.wrote("SPI 0"))
+            self.assertEqual(b.ask("C 13 4 0 0"), "c 13 4")
+            self.assertEqual(b.ask("C 12 11 150 0"), "c 12 -2") # a reader's CS cannot be an SPI pin
+        finally:
+            b.close()
+
+    def test_engine_end_to_end(self):
+        """Engine -> USB helper -> compiled UNO R3: a block script opens the servo when a known card
+        is read, the DHT reading arrives with its humidity, and an unknown card opens nothing."""
+        port = 18961
+        cfg = demo_config()
+        cfg["boards"] = cfg["boards"][:2]                       # main + 'garage' (UNO on USB)
+        cfg["components"] = [
+            {"id": "door", "type": "servo", "name": "Door", "board": "garage", "pin": 6, "props": {"open_angle": 95}},
+            {"id": "climate", "type": "dht_sensor", "name": "Climate", "board": "garage", "pin": 4, "props": {"interval": 2000}},
+            {"id": "reader", "type": "nfc_reader", "name": "Reader", "board": "garage", "pin": 10,
+             "props": {"cards": [{"uid": "04 a3 1f b2", "name": "Burak"}]}}]
+        cfg["scripts"]["workspace"] = {"blocks": {"languageVersion": 0, "blocks": [
+            {"type": "ev_card", "id": "h1", "fields": {"ENT": "reader", "WHICH": "known"}, "next": {"block": {
+                "type": "do_servo", "id": "s1", "fields": {"ENT": "door", "DO": "open"}}}}]}}
+        os.environ["QHOME_REAL_LINKS"] = "1"
+        master_fd, slave_fd = os.openpty()
+        board = Board(build("uno-parts"), stdin=master_fd, stdout=master_fd)
+        helper = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "qhome_usb_helper.py"), "--port", str(port),
+                                   "--device", os.ttyname(slave_fd)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        rig = Rig(cfg, link_port=port)
+        try:
+            os.write(slave_fd, b"~h 4 212 555\n")
+            self.assertTrue(rig.wait(lambda: rig.engine.online.get("garage"), 10))
+            self.assertTrue(board.wrote("SA 6", 3) and board.wrote("NI 10 255", 3))
+            self.assertTrue(board.wrote("SW 6 0", 3), "closed at start")
+            self.assertTrue(rig.wait(lambda: rig.state("climate") == 21.2, 6), "DHT temperature")
+            self.assertEqual(rig.engine.humidity_of("climate"), 55.5)
+            os.write(slave_fd, b"~n 0499AABB\n")               # an unknown card: nothing opens
+            self.assertTrue(rig.wait(lambda: rig.state("reader") == "0499AABB", 4))
+            time.sleep(0.3)
+            self.assertFalse(board.wrote("SW 6 95", 0.1))
+            os.write(slave_fd, b"~n 04A31FB2\n")
+            self.assertTrue(rig.wait(lambda: rig.state("reader") == "Burak", 4))
+            self.assertTrue(board.wrote("SW 6 95", 3), "the known card opened the door")
+            self.assertEqual(rig.engine.last_card("reader")["known"], True)
         finally:
             os.environ.pop("QHOME_REAL_LINKS", None)
             helper.kill()

@@ -8,6 +8,9 @@ Capabilities:
   din   digital input          dout  digital output       pwm  PWM output
   adc   analog input           dac   true analog output   cnt  pulse counter (interrupt)
   rgb   on-board RGB LED       matrix on-board LED matrix
+  servo hobby servo (SG90)     dht   DHT11 / DHT22 sensor     nfc  CS pin of an RC522 NFC reader
+The last three exist on satellite boards only (the satellite sketch drives them); see
+_add_device_caps() below.
 Notes are short codes; the web UI translates them (i18n key "note.<code>").
 
 Drawing data (`board`): unit = one header pitch (2.54 mm). Origin = top-left corner of the
@@ -349,7 +352,40 @@ MODELS = {
     "esp8266": _gpio("ESP8266 NodeMCU", _ESP8266_ROWS, 1023, _WIFI3, (3, 1), (4, 5), True,
                      board=_ESP8266_BOARD),
 }
-for _m in MODELS.values():
+# Hardware SPI of each satellite (MOSI, MISO, SCK): an RC522 NFC reader takes these three.
+_SPI = {"uno": (11, 12, 13), "nano": (11, 12, 13), "r4m": (11, 12, 13), "r4w": (11, 12, 13),
+        "nanor4": (11, 12, 13), "mega": (51, 50, 52), "esp32": (23, 19, 18), "esp32c3": (6, 5, 4),
+        "esp8266": (13, 12, 14)}
+# The Servo library of the AVR core takes a timer: dimming stops on these pins once a servo runs.
+_SERVO_TIMER = {"uno": (9, 10), "nano": (9, 10), "mega": (44, 45, 46)}
+MAX_SERVOS, MAX_DHT, MAX_NFC = 6, 4, 1     # per board; the satellite sketch has as many slots
+
+
+def _add_device_caps(key, m):
+    """Servo, DHT and NFC on every pin of a satellite that can drive a level (not on the UNO Q:
+    its master sketch does not drive these parts)."""
+    spi = _SPI.get(key)
+    if spi is None:
+        m["spi_pins"] = []
+        return
+    m["spi_pins"] = list(spi)
+    for p in m["pins"]:
+        if "dout" not in p["caps"]:
+            continue
+        if not (key == "esp8266" and p["id"] == 16):      # GPIO16 has no timer output
+            p["caps"].append("servo")
+        p["caps"].append("dht")
+        if p["id"] not in spi:
+            p["caps"].append("nfc")
+        if p["id"] in _SERVO_TIMER.get(key, ()):
+            p["notes"].append("servo_timer")
+        if p["id"] in spi:
+            p["notes"].append("spi_" + ("mosi", "miso", "sck")[spi.index(p["id"])])
+
+
+for _k, _m in MODELS.items():
+    _add_device_caps(_k, _m)
+    _m["servo_timer_pins"] = list(_SERVO_TIMER.get(_k, ()))
     _m["pin_by_id"] = {p["id"]: p for p in _m["pins"]}
 
 LINK_TYPES = ("local", "usb", "uart", "i2c", "wifi")
@@ -359,8 +395,9 @@ def model(name):
     return MODELS.get(name)
 
 
-def reserved_pins(board, boards):
-    """Pins a board cannot hand out because its link (or a link it hosts) uses them.
+def reserved_pins(board, boards, comps=()):
+    """Pins a board cannot hand out because its link (or a link it hosts) uses them, or
+    because an NFC reader on it takes the SPI pins.
 
     Returns {pin_id: reason_code}.
     """
@@ -368,6 +405,9 @@ def reserved_pins(board, boards):
     if not m:
         return {}
     out = {}
+    if any(c.get("type") == "nfc_reader" and c.get("board") == board.get("id") for c in comps):
+        for p in m.get("spi_pins", ()):
+            out[p] = "nfc_spi"
     lt = (board.get("link") or {}).get("type")
     if lt == "uart":
         for p in m["uart_pins"]:
@@ -434,4 +474,9 @@ if __name__ == "__main__":
     assert reserved_pins({"model": "esp32", "link": {"type": "usb"}}, []) == {3: "link_serial", 1: "link_serial"}
     assert reserved_pins({"model": "esp32c3", "link": {"type": "usb"}}, []) == {}
     assert reserved_pins({"model": "esp32", "link": {"type": "wifi"}}, []) == {}
+    assert reserved_pins({"id": "x", "model": "uno", "link": {"type": "usb"}}, [],
+                         [{"type": "nfc_reader", "board": "x", "pin": 10}]) == {
+        11: "nfc_spi", 12: "nfc_spi", 13: "nfc_spi", 0: "link_serial", 1: "link_serial"}
+    assert "servo" not in MODELS["unoq"]["pin_by_id"][9]["caps"]
+    assert "nfc" not in MODELS["uno"]["pin_by_id"][13]["caps"] and "nfc" in MODELS["uno"]["pin_by_id"][10]["caps"]
     print("ok, total /api/meta models size: %d bytes" % len(json.dumps(public_models())))

@@ -13,7 +13,7 @@
   --paper:#F3F5F4; --surface:#FFFFFF; --ink:#14211F; --muted:#5A6965; --line:#D7DEDB; --line-soft:#E7ECEA;
   --accent:#0A7C86; --accent-ink:#065A62; --accent-wash:#E3F2F3;
   --pcb:#0C5560; --pcb-deep:#083E46; --socket:#052B31; --silk:#E8F4F4; --gold:#D8B45C;
-  --din:#2A6CA8; --dout:#1E8757; --pwm:#7650C4; --adc:#B0650A; --dac:#C0430F; --cnt:#0C7791; --rgb:#B8377A; --mx:#46566A; --virt:#6B7280;
+  --din:#2A6CA8; --dout:#1E8757; --pwm:#7650C4; --adc:#B0650A; --dac:#C0430F; --cnt:#0C7791; --rgb:#B8377A; --mx:#46566A; --virt:#6B7280; --servo:#8A6A12; --dht:#B4432F; --nfc:#2F5FA8;
   --ok:#1E9655; --warn:#B27208; --err:#C2362F; --amber:#F5A524;
   --body:"Barlow",system-ui,-apple-system,"Segoe UI",sans-serif;
   --label:"Barlow Semi Condensed","Barlow",system-ui,sans-serif;
@@ -88,6 +88,7 @@ pre.code{background:var(--socket);color:#D7EEF0;padding:12px 14px;border-radius:
 .tag{display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:20px;padding:0 5px;border-radius:4px;font:600 12px/1 var(--label);color:#fff;background:var(--virt);letter-spacing:.03em}
 .f-din{background:var(--din)} .f-dout{background:var(--dout)} .f-pwm{background:var(--pwm)} .f-adc{background:var(--adc)}
 .f-dac{background:var(--dac)} .f-cnt{background:var(--cnt)} .f-rgb{background:var(--rgb)} .f-matrix{background:var(--mx)}
+.f-servo{background:var(--servo)} .f-dht{background:var(--dht)} .f-nfc{background:var(--nfc)}
 .legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--muted);margin:2px 0 14px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 
@@ -345,3 +346,17 @@ h3 > .hint,.ftxt > .hint{margin-left:8px}
   .sysgrid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))} .cols{grid-template-columns:1fr} .dialog{padding:16px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* servo, DHT and NFC tiles; the NFC reader's card list */
+.tile .hum{display:block;font:500 14px/1.4 var(--body);color:var(--muted);margin-top:4px}
+.card-last{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border-radius:8px;border:1px solid var(--line);margin:2px 0 8px}
+.card-last.known{border-color:var(--ok);background:#EAF6EF} .card-last.unknown{border-color:var(--err);background:#FBECEA}
+.card-last .big{font-size:22px} .card-last.unknown .big{color:var(--err)}
+.cards{display:flex;flex-direction:column;gap:6px;margin-top:4px}
+.cardrow{display:grid;grid-template-columns:minmax(0,9.5em) minmax(0,1fr) auto;gap:6px;align-items:center}
+.cardrow input{min-width:0;padding:5px 8px;border:1px solid var(--line);border-radius:6px}
+.cardrow input.uid{font-family:ui-monospace,"DejaVu Sans Mono",monospace;font-size:13px}
+.cards .inline{flex-wrap:wrap}
+.cardrow .cardx{min-width:30px;padding:4px 0;font-size:16px;line-height:1;color:var(--err);border-color:var(--line)}
+.btn.sm:disabled{opacity:.5;cursor:default}
+.cardsim{flex-wrap:wrap} .cardsim input{min-width:9em;font-family:ui-monospace,"DejaVu Sans Mono",monospace;font-size:13px}

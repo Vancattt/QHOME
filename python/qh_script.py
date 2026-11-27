@@ -21,26 +21,30 @@ MAX_THREADS = 200
 
 # which component types each entity dropdown accepts (the editor uses the same table)
 BOOLISH = ("binary_input", "switch_output", "virtual_switch", "pwm_output", "rgb_led")
-NUMERIC = ("analog_sensor", "pulse_counter", "pwm_output", "dac_output")
+NUMERIC = ("analog_sensor", "pulse_counter", "pwm_output", "dac_output", "servo", "dht_sensor")
 SWITCHABLE = ("switch_output", "virtual_switch", "pwm_output", "rgb_led")
 # devices whose value an LED matrix can show ("value" mode; "bar" needs one of NUMERIC)
 MX_SOURCES = ("analog_sensor", "pulse_counter", "pwm_output", "dac_output",
-              "binary_input", "switch_output", "virtual_switch")
+              "binary_input", "switch_output", "virtual_switch", "servo", "dht_sensor", "nfc_reader")
 MX_BLOCK_MODES = ("auto", "clock", "status", "ip", "off")
 ENTITY_FIELDS = {
     "ev_state": BOOLISH, "ev_above": NUMERIC, "do_turn": SWITCHABLE, "do_toggle": SWITCHABLE,
-    "do_set": ("pwm_output", "dac_output"), "do_rgb": ("rgb_led",), "do_show": ("led_matrix",),
+    "do_set": ("pwm_output", "dac_output", "servo"), "do_rgb": ("rgb_led",), "do_show": ("led_matrix",),
     "do_clear": ("led_matrix",), "get_on": BOOLISH, "get_value": NUMERIC,
     "do_show_for": ("led_matrix",), "do_mx_icon": ("led_matrix",), "do_mx_anim": ("led_matrix",),
     "do_mx_value": ("led_matrix",), "do_mx_mode": ("led_matrix",),
     "do_mx_value.SRC": MX_SOURCES,     # choices of the SRC dropdown; never matches a block type
+    "do_servo": ("servo",), "ev_card": ("nfc_reader",), "ev_hum": ("dht_sensor",), "get_hum": ("dht_sensor",),
 }
+CARD_WHICH = ("any", "known", "unknown")
+CARD_WHAT = ("name", "id", "known")
 BOARD_BLOCKS = ("ev_board", "get_board")
-HATS = ("ev_start", "ev_state", "ev_above", "ev_every", "ev_time", "ev_mqtt", "ev_board")
-STATEMENTS = ("do_turn", "do_toggle", "do_set", "do_rgb", "do_show", "do_clear", "do_show_for",
+HATS = ("ev_start", "ev_state", "ev_above", "ev_every", "ev_time", "ev_mqtt", "ev_board", "ev_card",
+        "ev_hum")
+STATEMENTS = ("do_turn", "do_toggle", "do_set", "do_rgb", "do_show", "do_clear", "do_show_for", "do_servo",
               "do_mx_icon", "do_mx_anim", "do_mx_value", "do_mx_mode", "do_publish", "do_log", "ctl_wait", "ctl_repeat", "ctl_forever", "ctl_if", "ctl_ifelse",
               "ctl_wait_until", "ctl_repeat_until", "ctl_stop", "variables_set", "math_change")
-VALUES = ("get_on", "get_value", "get_board", "get_time", "get_between", "get_mqtt",
+VALUES = ("get_on", "get_value", "get_board", "get_time", "get_between", "get_mqtt", "get_hum", "get_card",
           "math_number", "math_arithmetic", "math_round", "math_modulo", "math_constrain",
           "math_random_int", "logic_compare", "logic_operation", "logic_negate",
           "logic_boolean", "text", "text_join", "variables_get")
@@ -132,6 +136,12 @@ def validate(workspace, comps, boards):
                 errs.append("%s: unknown matrix animation." % where)
             if typ == "do_mx_mode" and _field(b, "MODE") not in MX_BLOCK_MODES:
                 errs.append("%s: unknown matrix mode." % where)
+            if typ == "do_servo" and _field(b, "DO") not in ("open", "close", "toggle"):
+                errs.append("%s: unknown servo action." % where)
+            if typ == "ev_card" and _field(b, "WHICH", "any") not in CARD_WHICH:
+                errs.append("%s: unknown card choice." % where)
+            if typ == "get_card" and _field(b, "WHAT", "name") not in CARD_WHAT:
+                errs.append("%s: unknown card detail." % where)
             if typ in BOARD_BLOCKS and _field(b, "BOARD", "") not in boards:
                 errs.append("%s: pick a board that exists." % where)
             if typ == "ev_time" and not HHMM_RE.match(str(_field(b, "AT", ""))):
@@ -232,8 +242,8 @@ class Runtime:
                     self._launch(h)
                 elif want == "off" and not truthy(new) and truthy(old):
                     self._launch(h)
-            elif h["type"] == "ev_above":
-                v = self.e.value_of(cid)
+            elif h["type"] in ("ev_above", "ev_hum"):
+                v = self.e.value_of(cid) if h["type"] == "ev_above" else self.e.humidity_of(cid)
                 if not isinstance(v, (int, float)):
                     continue
                 try:
@@ -245,6 +255,15 @@ class Runtime:
                 if cond and mem.get("armed", False):
                     self._launch(h)
                 mem["armed"] = not cond
+
+    def on_card(self, cid, scan):
+        """A card was held to NFC reader `cid`. scan: {"uid", "name", "known", ...}."""
+        for h in self.hats:
+            if h["type"] != "ev_card" or _field(h, "ENT") != cid:
+                continue
+            which = _field(h, "WHICH", "any")
+            if which == "any" or (which == "known") == bool(scan.get("known")):
+                self._launch(h, {"card": dict(scan)})
 
     def on_mqtt(self, topic, payload, match):
         for h in self.hats:
@@ -369,6 +388,8 @@ class Runtime:
             e.command(_field(b, "ENT"), "set", _field(b, "COLOR", "off"))
         elif t == "do_show":
             e.command(_field(b, "ENT"), "text", text(self._eval(_child(b, "TEXT"), ctx)))
+        elif t == "do_servo":
+            e.command(_field(b, "ENT"), _field(b, "DO", "open"))
         elif t == "do_clear":
             e.command(_field(b, "ENT"), "clear")
         elif t == "do_show_for":
@@ -461,6 +482,17 @@ class Runtime:
             return e.board_online(_field(b, "BOARD"))
         if t == "get_mqtt":
             return ctx.get("mqtt", "")
+        if t == "get_hum":
+            h = e.humidity_of(_field(b, "ENT"))
+            return 0.0 if h is None else float(h)
+        if t == "get_card":
+            scan = ctx.get("card") or e.last_card() or {}
+            what = _field(b, "WHAT", "name")
+            if what == "known":
+                return bool(scan.get("known"))
+            if what == "id":
+                return str(scan.get("uid", ""))
+            return str(scan.get("name") or scan.get("uid") or "")
         if t == "get_time":
             lt = e.local_time()
             what = _field(b, "WHAT", "hour")

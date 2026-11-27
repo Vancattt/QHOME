@@ -17,17 +17,28 @@
 //                     A <pin> <0..4095>      PWM / DAC write
 //                     R                      release all pins -> r 1
 //   board -> master   E <pin> <value>        input changed / periodic reading
+//                     T <pin> <t x10> <h x10> DHT reading (T <pin> e: the sensor did not answer)
+//                     N <pin> <card id>      an NFC card was held to the reader (hex, upper case)
 //                     B <boot>               the board just started
 // Modes: 0 off, 1 input, 2 input pull-up, 3 input pull-down (plain input where the chip has none),
-//        4 output, 5 PWM, 6 analog input, 7 DAC, 8 pulse counter (interrupt pins only)
+//        4 output, 5 PWM, 6 analog input, 7 DAC, 8 pulse counter (interrupt pins only),
+//        9 servo ("A <pin> <0..180>" sets the angle), 10 DHT sensor (<debounce> = 11 or 22,
+//        <interval> = ms between readings), 11 RC522 NFC reader (the pin is its SDA/CS line; the
+//        reader sits on the board's SPI pins MOSI/MISO/SCK, its RST pin goes to 3.3 V)
 // Errors in the reply to C: -1 no such pin here (or it carries the link), -2 the pin cannot do
-//        that, -3 no counter or PWM channel left
+//        that (or the library for that part is not installed), -3 no counter, PWM channel,
+//        servo, DHT or NFC slot left
+//
+// Libraries: servo and NFC use libraries that this sketch picks up when they are installed
+// (Sketch > Include Library > Manage Libraries): "Servo" (built into the AVR, UNO R4 and ESP8266
+// cores), "ESP32Servo" on ESP32 boards, and "MFRC522" for the RC522 NFC reader. Without them the
+// sketch still compiles and those parts are refused with -2. The DHT code is built in.
 
 #include "config.h"
 
 #define QL_PROTO 1
 enum { M_OFF = 0, M_DIN = 1, M_DIN_PU = 2, M_DIN_PD = 3, M_DOUT = 4,
-       M_PWM = 5, M_ADC = 6, M_DAC = 7, M_CNT = 8 };
+       M_PWM = 5, M_ADC = 6, M_DAC = 7, M_CNT = 8, M_SERVO = 9, M_DHT = 10, M_NFC = 11 };
 
 // ---------------- board facts ----------------
 #if defined(ARDUINO_ARCH_ESP8266)
@@ -238,6 +249,26 @@ enum { M_OFF = 0, M_DIN = 1, M_DIN_PU = 2, M_DIN_PD = 3, M_DOUT = 4,
   #endif
 #endif
 
+// ---------------- optional parts: servo and NFC libraries ----------------
+#if defined(__has_include)
+  #if defined(ARDUINO_ARCH_ESP32)
+    #if __has_include(<ESP32Servo.h>)
+      #include <ESP32Servo.h>
+      #define QL_SERVO 1
+    #endif
+  #elif __has_include(<Servo.h>)
+    #include <Servo.h>
+    #define QL_SERVO 1
+  #endif
+  #if __has_include(<MFRC522.h>)
+    #include <SPI.h>
+    #include <MFRC522.h>
+    #define QL_NFC 1
+  #endif
+#endif
+#define NSERVO 6
+#define NDHT 4
+
 struct PinState {
   uint8_t  mode;
   uint8_t  last;       // last reported level (2 = not reported yet)
@@ -263,6 +294,19 @@ static uint8_t pwmCount;               // pins in PWM mode right now
 static uint16_t ledcBusy;              // bit n: LEDC channel n drives a pin (PinState.slot = n)
 #endif
 static uint16_t bootId;
+
+#if defined(QL_SERVO)
+static Servo servos[NSERVO];
+static int8_t servoPin[NSERVO];
+#endif
+static int8_t dhtPin[NDHT];
+#if defined(QL_NFC)
+static MFRC522 rfid;
+#endif
+static int8_t nfcPin = -1;              // CS pin of the RC522, -1 = no reader
+static bool spiPin(int p) {              // the board's hardware SPI pins (every core names them)
+  return p == MOSI || p == MISO || p == SCK;
+}
 
 static void IRAM_ATTR isr0() { CNT[0]++; }
 static void IRAM_ATTR isr1() { CNT[1]++; }
@@ -330,6 +374,7 @@ static void outBoot(char k) {
 
 // ---------------- pins ----------------
 static bool linkPin(int p) {
+  if (nfcPin >= 0 && spiPin(p)) return true;     // the NFC reader owns the SPI pins
 #if QL_LINK == QL_I2C
   return p == SDA || p == SCL;
 #elif QL_LINK == QL_WIFI
@@ -346,9 +391,9 @@ static int pwmStart(int p) {             // 0 = running at duty 0, -3 = the chip
 #endif
   pinMode(p, OUTPUT);
 #if defined(QL_LEDC2)
-  uint8_t ch = 0;
-  while (ch < QL_PWM_MAX && (ledcBusy & (1u << ch))) ch++;
-  if (ch >= QL_PWM_MAX || ledcSetup(ch, 1000, 8) == 0) { pinMode(p, INPUT); return -3; }
+  int ch = QL_PWM_MAX - 1;               // from the top down: ESP32Servo (servos) takes channels from 0 up
+  while (ch >= 0 && (ledcBusy & (1u << ch))) ch--;
+  if (ch < 0 || ledcSetup(ch, 1000, 8) == 0) { pinMode(p, INPUT); return -3; }
   ledcAttachPin(p, ch);                  // after pinMode(): that call hands the pin back to plain GPIO
   ledcWrite(ch, 0);
   ledcBusy |= (uint16_t)(1u << ch);
@@ -379,6 +424,18 @@ static void releasePin(int p) {
   PinState &s = P[p];
   if (s.mode == M_OFF) return;
   if (s.mode == M_CNT) { detachInterrupt(digitalPinToInterrupt(p)); cntPin[s.slot] = -1; }
+#if defined(QL_SERVO)
+  if (s.mode == M_SERVO) {
+    servos[s.slot].detach(); servoPin[s.slot] = -1;
+  #if defined(ARDUINO_ARCH_ESP32)
+    if (pwmCount > 0) pwmCount--;                // ESP32Servo used one LEDC channel
+  #endif
+  }
+#endif
+  if (s.mode == M_DHT) dhtPin[s.slot] = -1;
+#if defined(QL_NFC)
+  if (s.mode == M_NFC) { rfid.PCD_AntennaOff(); SPI.end(); nfcPin = -1; }
+#endif
   if (s.mode == M_PWM) pwmStop(p);
   if (s.mode == M_DOUT || s.mode == M_PWM) digitalWrite(p, LOW);
 #if defined(QL_ESP32)
@@ -397,7 +454,8 @@ static int configure(int p, int mode, long interval, long debounce) {
   s.last = 2; s.pending = 2; s.t = 0;
   if (mode == M_OFF) return 0;
   if (QL_ADC_ONLY(p) && mode != M_ADC) return -2;
-  if (!QL_CAN_OUT(p) && (mode == M_DOUT || mode == M_PWM || mode == M_DAC || mode == M_CNT)) return -2;
+  if (!QL_CAN_OUT(p) && (mode == M_DOUT || mode == M_PWM || mode == M_DAC || mode == M_CNT ||
+                         mode >= M_SERVO)) return -2;
   switch (mode) {
     case M_DIN: pinMode(p, INPUT); break;
     case M_DIN_PU:
@@ -439,10 +497,121 @@ static int configure(int p, int mode, long interval, long debounce) {
       attachInterrupt(digitalPinToInterrupt(p), ISRS[slot], FALLING);
       break;
     }
+    case M_SERVO: {
+#if defined(QL_SERVO)
+  #if defined(QL_ESP8266)
+      if (p == 16) return -2;                    // GPIO16 has no timer output
+  #endif
+      int slot = -1;
+      for (int i = 0; i < NSERVO; i++) if (servoPin[i] < 0) { slot = i; break; }
+      if (slot < 0) return -3;
+  #if defined(ARDUINO_ARCH_ESP32)
+      if (QL_PWM_MAX && pwmCount >= QL_PWM_MAX) return -3;   // shares the LEDC channels with PWM
+  #endif
+      servos[slot].attach(p);                    // what attach() returns differs between the cores
+      if (!servos[slot].attached()) return -3;
+      servoPin[slot] = p; s.slot = slot;
+  #if defined(ARDUINO_ARCH_ESP32)
+      pwmCount++;
+  #endif
+      break;
+#else
+      return -2;                                 // the Servo / ESP32Servo library is not installed
+#endif
+    }
+    case M_DHT: {
+      int slot = -1;
+      for (int i = 0; i < NDHT; i++) if (dhtPin[i] < 0) { slot = i; break; }
+      if (slot < 0) return -3;
+      dhtPin[slot] = p; s.slot = slot;
+      s.debounce = debounce == 11 ? 11 : 22;     // the sensor model
+      if (s.interval < 2000) s.interval = 2000;  // the sensors need 1-2 s between readings
+      pinMode(p, INPUT_PULLUP);
+      s.t = millis() - s.interval + 1500;        // first reading after the sensor has settled
+      break;
+    }
+    case M_NFC: {
+#if defined(QL_NFC)
+      if (spiPin(p)) return -2;
+      if (nfcPin >= 0) return -3;                // one reader per board
+  #if QL_LINK != QL_I2C && QL_LINK != QL_WIFI
+      if (spiPin(LINK_RX) || spiPin(LINK_TX)) return -2;
+  #endif
+      nfcPin = p;
+      SPI.begin();
+      rfid.PCD_Init((byte)p, MFRC522::UNUSED_PIN);
+      s.t = 0;
+      break;
+#else
+      return -2;                                 // the MFRC522 library is not installed
+#endif
+    }
     default: return -2;
   }
   s.mode = mode;
   return mode;
+}
+
+// ---------------- DHT11 / DHT22: one-wire protocol, timed with micros() ----------------
+// Returns 0 and the reading in tenths, or -1 when the sensor did not answer correctly.
+static long dhtPulse(int p, int level, uint32_t limitUs) {   // how long the line stays at `level`
+  uint32_t t0 = micros();
+  while (digitalRead(p) == level) {
+    if (micros() - t0 > limitUs) return -1;
+  }
+  return (long)(micros() - t0);
+}
+static int dhtRead(int p, uint8_t model, int *t10, int *h10) {
+  uint8_t d[5] = { 0, 0, 0, 0, 0 };
+  pinMode(p, OUTPUT);
+  digitalWrite(p, LOW);
+  delay(model == 11 ? 20 : 2);                   // start signal: DHT11 >= 18 ms, DHT22 >= 1 ms
+  pinMode(p, INPUT_PULLUP);
+  delayMicroseconds(30);
+  int ok = 0;
+#if defined(QL_ESP)
+  noInterrupts();          // Wi-Fi interrupts would stretch the pulses. Elsewhere interrupts stay
+#endif                     // on: with them off for 4 ms, micros() on AVR misses timer overflows
+  if (dhtPulse(p, HIGH, 200) >= 0 && dhtPulse(p, LOW, 200) >= 0 && dhtPulse(p, HIGH, 200) >= 0) {
+    ok = 1;
+    for (int i = 0; i < 40 && ok; i++) {
+      long lo = dhtPulse(p, LOW, 200);           // ~50 us low, then high: 26-28 us = 0, 70 us = 1
+      long hi = lo < 0 ? -1 : dhtPulse(p, HIGH, 200);
+      if (hi < 0) ok = 0;
+      else if (hi > 45) d[i / 8] |= (uint8_t)(0x80 >> (i % 8));
+    }
+  }
+#if defined(QL_ESP)
+  interrupts();
+#endif
+  pinMode(p, INPUT_PULLUP);
+  if (!ok || (uint8_t)(d[0] + d[1] + d[2] + d[3]) != d[4]) return -1;
+  if (model == 11) {
+    *h10 = d[0] * 10 + d[1];
+    *t10 = (d[2] & 0x7F) * 10 + d[3];
+    if (d[2] & 0x80) *t10 = -*t10;
+  } else {
+    *h10 = (int)(((uint16_t)d[0] << 8) | d[1]);
+    *t10 = (int)((((uint16_t)(d[2] & 0x7F)) << 8) | d[3]);
+    if (d[2] & 0x80) *t10 = -*t10;
+  }
+  if (*h10 > 1000 || *t10 < -400 || *t10 > 1250) return -1;
+  return 0;
+}
+
+// ---------------- RC522: report a card once each time it is held to the reader ----------------
+static void nfcPoll() {
+#if defined(QL_NFC)
+  // A card that was read is put to sleep (HaltA) and stays silent until it leaves the field,
+  // so holding it there reports it once; taking it away and back reports it again.
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+  char buf[48];
+  int n = snprintf(buf, sizeof(buf), "N %d ", nfcPin);
+  for (byte i = 0; i < rfid.uid.size && i < 10 && n < (int)sizeof(buf) - 3; i++)
+    n += snprintf(buf + n, sizeof(buf) - n, "%02X", rfid.uid.uidByte[i]);
+  rfid.PICC_HaltA();
+  outLine(buf);
+#endif
 }
 
 // One analog reading in the counts the master expects (qh_boards: adc_max at vref).
@@ -474,6 +643,9 @@ static void handleLine(char *line) {
       if (a[0] < 0 || a[0] >= NPIN) break;
       long v = a[1] < 0 ? 0 : (a[1] > 4095 ? 4095 : a[1]);
       uint8_t m = P[a[0]].mode;
+#if defined(QL_SERVO)
+      if (m == M_SERVO) { servos[P[a[0]].slot].write((int)(v > 180 ? 180 : v)); break; }
+#endif
 #if defined(QL_R4)
       if (m == M_PWM || m == M_DAC) analogWrite((int)a[0], (int)v);       // 12-bit set in setup()
 #else
@@ -623,6 +795,10 @@ static void mqttLoop() {
 // ---------------- setup / loop ----------------
 void setup() {
   for (int i = 0; i < NCNT; i++) cntPin[i] = -1;
+#if defined(QL_SERVO)
+  for (int i = 0; i < NSERVO; i++) servoPin[i] = -1;
+#endif
+  for (int i = 0; i < NDHT; i++) dhtPin[i] = -1;
 #if defined(ARDUINO_ARCH_ESP32)
   bootId = (uint16_t)esp_random();
 #elif defined(QL_ESP8266)
@@ -702,6 +878,19 @@ void loop() {
           noInterrupts(); uint32_t c = CNT[s.slot]; interrupts();
           out2('E', p, (long)c);
         }
+        break;
+      case M_DHT:
+        if (now - s.t >= s.interval) {
+          s.t = now;
+          int t10 = 0, h10 = 0;
+          char buf[32];
+          if (dhtRead(p, (uint8_t)s.debounce, &t10, &h10) == 0) snprintf(buf, sizeof(buf), "T %d %d %d", p, t10, h10);
+          else snprintf(buf, sizeof(buf), "T %d e", p);
+          outLine(buf);
+        }
+        break;
+      case M_NFC:
+        if (now - s.t >= 150) { s.t = now; nfcPoll(); }
         break;
       default: break;
     }

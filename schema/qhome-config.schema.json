@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "QHome setup",
-  "description": "Boards, devices and block scripts of a QHome installation (version 2.1.0).",
+  "description": "Boards, devices and block scripts of a QHome installation (version 2.2.0).",
   "type": "object",
   "required": [
     "device",
@@ -264,7 +264,10 @@
               "dac_output",
               "rgb_led",
               "led_matrix",
-              "virtual_switch"
+              "virtual_switch",
+              "servo",
+              "dht_sensor",
+              "nfc_reader"
             ]
           },
           "board": {
@@ -806,6 +809,145 @@
                         "restore"
                       ],
                       "default": "restore"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "servo"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "properties": {
+                "props": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "open_angle": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 180,
+                      "default": 90
+                    },
+                    "closed_angle": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 180,
+                      "default": 0
+                    },
+                    "restore": {
+                      "enum": [
+                        "closed",
+                        "open",
+                        "restore"
+                      ],
+                      "default": "closed"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "dht_sensor"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "properties": {
+                "props": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "model": {
+                      "enum": [
+                        "dht22",
+                        "dht11"
+                      ],
+                      "default": "dht22"
+                    },
+                    "interval": {
+                      "type": "number",
+                      "minimum": 2000,
+                      "maximum": 60000,
+                      "default": 5000
+                    },
+                    "temp_offset": {
+                      "type": "number",
+                      "minimum": -20,
+                      "maximum": 20,
+                      "default": 0
+                    },
+                    "hum_offset": {
+                      "type": "number",
+                      "minimum": -50,
+                      "maximum": 50,
+                      "default": 0
+                    },
+                    "decimals": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 2,
+                      "default": 1
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "nfc_reader"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "properties": {
+                "props": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cards": {
+                      "type": "array",
+                      "maxItems": 50,
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "uid"
+                        ],
+                        "additionalProperties": false,
+                        "properties": {
+                          "uid": {
+                            "type": "string",
+                            "pattern": "^[0-9A-Fa-f :-]{8,40}$",
+                            "description": "Card id as the reader shows it: 8, 14 or 20 hex digits"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "default": []
                     }
                   }
                 }

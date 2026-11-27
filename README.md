@@ -115,7 +115,19 @@ Notes on the ESP boards:
 - Boot pins (ESP32: D2, D5, D12, D15; ESP32-C3: IO2, IO8, IO9; NodeMCU: D3, D4, D8) decide how the board starts. The page shows a note on each; do not hold them with a strong pull or a relay input.
 - On the ESP32-C3 and the NodeMCU the printed names are not always the GPIO numbers; the page shows both.
 
-Not covered yet: servo and tone outputs, I2C/SPI sensor drivers, CAN.
+### Servo, temperature and humidity, NFC reader (satellites)
+
+On the satellite boards (not on the UNO Q's own pins) three more parts can be given a pin:
+
+| Part | Device type | Wiring | Notes |
+|---|---|---|---|
+| Servo (SG90) | Servo motor | signal to the pin, red to 5 V, brown to GND; own 5 V supply, GND shared | up to 6 per board; open and closed angle in its settings. On UNO R3/Nano dimming stops on D9/D10 once a servo runs (Mega: D44-D46) |
+| DHT22 / DHT11 | Temperature & humidity | data to the pin, VCC 3.3-5 V, GND; 10 kΩ data to VCC on a bare sensor | up to 4 per board, every 2 s at the most; value = temperature, humidity alongside (blocks, tile, MQTT `<node>/<id>/humidity`, a second Home Assistant sensor) |
+| RC522 (13.56 MHz) | NFC card reader | SDA to the pin, SCK/MOSI/MISO to the board's SPI pins, RST and 3.3V to 3.3 V | one per board; takes the SPI pins (D11-D13 on UNO/Nano/R4, D50-D52 Mega, D23/D19/D18 ESP32, IO6/IO5/IO4 ESP32-C3, D7/D6/D5 NodeMCU). Known cards get a name in the reader's settings ("Add the last card"); scans go to the Log, a pop-up on every page, MQTT `<node>/<id>/state` and `<node>/<id>/scan` |
+
+The satellite sketch picks up the libraries **Servo** (built into the AVR, UNO R4 and ESP8266 packages), **ESP32Servo** (ESP32 boards) and **MFRC522** (1.4 or newer) when they are installed in the Arduino IDE. Without them it still compiles and refuses those parts. The DHT code is built in.
+
+Not covered yet: tone outputs, I2C/SPI sensor drivers other than the RC522, CAN.
 
 ## Connecting other boards
 
@@ -162,9 +174,9 @@ The **Blocks** tab is a Scratch-style workspace (Blockly with the Scratch render
 
 | Category | Blocks |
 |---|---|
-| Events | when QHome starts; when a device turns on / off / changes; when a value goes above / below; every N seconds / minutes / hours; at HH:MM on chosen days; when a board goes online / offline; when an MQTT message arrives |
-| Devices | turn on / off, toggle, set level, set RGB colour; for the matrix: show a text, show a text for N seconds, show an icon, play an animation, show a device's value as a number or a bar, switch the view (as set up, clock, board status, web address, off), clear |
-| Sensing | is on, value of, board is online, current hour / minute / second / weekday, time is between |
+| Events | when QHome starts; when a device turns on / off / changes; when a value goes above / below; when the humidity goes above / below; every N seconds / minutes / hours; at HH:MM on chosen days; when a board goes online / offline; when an MQTT message arrives; when a (known / unknown) card is held to a reader |
+| Devices | turn on / off, toggle, set level (also a servo's angle), open / close a servo, set RGB colour; for the matrix: show a text, show a text for N seconds, show an icon, play an animation, show a device's value as a number or a bar, switch the view (as set up, clock, board status, web address, off), clear |
+| Sensing | is on, value of, humidity of, card name / id / is known, board is online, current hour / minute / second / weekday, time is between |
 | Control | wait, repeat, forever, if, if / else, wait until, repeat until, stop this script |
 | Operators | arithmetic, compare, and / or / not, random, round, remainder, constrain, text, join |
 | Variables | create, set, change; live values show on the dashboard |
@@ -251,9 +263,11 @@ Text lines, newline terminated, the same on every link.
 | to board | `L <led> <bits>`, `M <104 digits>` | RGB LED, matrix frame (UNO Q nodes) |
 | to board | `R` | release all pins; reply `r 1` |
 | from board | `E <pin> <value>` | input changed or periodic reading |
+| from board | `T <pin> <temp x10> <hum x10>` | DHT reading (`T <pin> e`: no answer) |
+| from board | `N <pin> <card id>` | a card was held to the NFC reader (hex) |
 | from board | `B <boot id>` | the board just started |
 
-Modes: 0 off, 1 input, 2 input pull-up, 3 input pull-down (plain input where the chip has none), 4 output, 5 PWM, 6 analog in, 7 DAC, 8 pulse counter. Errors: -1 the pin does not exist or carries the link, -2 the pin cannot do that, -3 no PWM channel or counter slot left. A changed boot id tells the master the board restarted, and it sends the setup again. The same hello is how new boards are detected: the master sends `H` to unassigned USB ports and to boards that announce themselves on `qlink/<id>/status`.
+Modes: 0 off, 1 input, 2 input pull-up, 3 input pull-down (plain input where the chip has none), 4 output, 5 PWM, 6 analog in, 7 DAC, 8 pulse counter, 9 servo (`A <pin> <0-180>` sets the angle), 10 DHT sensor (the debounce field is 11 or 22), 11 RC522 NFC reader (the pin is its SDA/CS). Errors: -1 the pin does not exist or carries the link, -2 the pin cannot do that (or the library is missing), -3 no PWM channel, counter, servo, DHT or reader slot left. A changed boot id tells the master the board restarted, and it sends the setup again. The same hello is how new boards are detected: the master sends `H` to unassigned USB ports and to boards that announce themselves on `qlink/<id>/status`.
 
 ## Not in this version
 

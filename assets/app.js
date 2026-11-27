@@ -37,7 +37,11 @@ function lsGet(key, fallback) {
 function lsSet(key, value) { try { localStorage.setItem(key, value); } catch (e) { /* storage blocked */ } }
 const RGB_CSS = { off: "#2B3331", red: "#F04438", green: "#22C55E", yellow: "#FACC15", blue: "#3B82F6", magenta: "#D946EF", cyan: "#22D3EE", white: "#FFFFFF" };
 const ID_PREFIX = { binary_input: "input", analog_sensor: "sensor", pulse_counter: "counter", switch_output: "relay", pwm_output: "dimmer",
-                    dac_output: "analog_out", rgb_led: "led", led_matrix: "matrix", virtual_switch: "flag" };
+                    dac_output: "analog_out", rgb_led: "led", led_matrix: "matrix", virtual_switch: "flag",
+                    servo: "servo", dht_sensor: "climate", nfc_reader: "reader" };
+// Capabilities every pin of a satellite has (servo, DHT, NFC): listed when a pin is picked, but
+// not drawn as marks on each pin or in the legend, where they would only repeat "digital out".
+const QUIET_CAPS = ["servo", "dht", "nfc"];
 const ID_RE = /^[a-z][a-z0-9_]{0,31}$/;
 
 // ------------------------------------------------------------------ state
@@ -72,6 +76,7 @@ function reservedPins(b) {
   if (lt === "uart") uart.forEach(p => (out[p] = "link_serial"));
   if (lt === "usb" && m.usb_shares_uart) serial.forEach(p => (out[p] = "link_serial"));
   if (lt === "i2c") i2c.forEach(p => (out[p] = "link_i2c"));
+  if (DRAFT.components.some(c => c.type === "nfc_reader" && c.board === b.id)) (m.spi_pins || []).forEach(p => (out[p] = "nfc_spi"));
   if (lt === "local") for (const o of DRAFT.boards) {
     const ol = o.link || {};
     if (o === b) continue;
@@ -346,7 +351,7 @@ function mxTile(el, c) {
 }
 function tileSig(c) {             // everything a tile's picture depends on
   const s = stOf(c.id), a = HIST[c.id];
-  return JSON.stringify([s.v, s.txt, ST && ST.boards && ST.boards[c.board], a ? a._t : 0,
+  return JSON.stringify([s.v, s.txt, s.h, s.card, s.t, ST && ST.boards && ST.boards[c.board], a ? a._t : 0,
     c.type === "led_matrix" ? [frameOf(c.id), mxInfo(c.id), TILE_MX[c.id]] : 0]);
 }
 function tile(c) {
@@ -381,7 +386,56 @@ function tile(c) {
     el.append(h("div", { class: "swatches" }, META.colors.map(k => h("button", { class: "swatch", title: t("color." + k), "aria-label": t("color." + k),
       "aria-pressed": v === k ? "true" : "false", style: "background:" + RGB_CSS[k], onclick: () => command(c.id, "set", k) }))));
   } else if (c.type === "led_matrix") mxTile(el, c);
+  else if (c.type === "servo") {
+    const ang = typeof v === "number" ? Math.round(v) : null;
+    el.append(h("div", { class: "line" }, h("span", { class: "big" }, ang == null ? "--" : ang, h("span", { class: "unit" }, "°")),
+      h("span", { class: "grow" }), h("button", { class: "btn sm", onclick: () => command(c.id, "open") }, t("dash.servo.open")),
+      h("button", { class: "btn sm", onclick: () => command(c.id, "close") }, t("dash.servo.close"))),
+      h("input", { type: "range", min: 0, max: 180, value: ang || 0, "aria-label": c.name, onchange: e => command(c.id, "set", +e.target.value) }));
+  } else if (c.type === "dht_sensor") {
+    el.append(h("div", { class: "big" }, s.txt || "--", h("span", { class: "unit" }, " °C"),
+      h("span", { class: "hum" }, s.h == null ? "" : s.h + " % " + t("dash.hum"))), sparkline(c.id));
+  } else if (c.type === "nfc_reader") el.append(...cardTile(c, s, bs));
   return el;
+}
+function cardTile(c, s, bs) {
+  const card = s.card, out = [];
+  if (!card) out.push(h("div", { class: "card-last muted" }, t("dash.card.none")));
+  else {
+    const at = new Date(card.t * 1000).toLocaleTimeString();
+    out.push(h("div", { class: "card-last " + (card.known ? "known" : "unknown") },
+      h("span", { class: "big" }, card.known ? (card.name || card.uid) : t("dash.card.unknown")),
+      h("span", { class: "small muted" }, card.uid + " · " + t("dash.card.at", at))));
+  }
+  if (/simulated/.test(bs.text || "")) {            // try the reader without one
+    const known = (propsOf(c).cards || []).map(x => String(x.uid || "").replace(/[^0-9a-fA-F]/g, "").toUpperCase()).filter(Boolean);
+    const inp = h("input", { type: "text", value: TILE_ARG[c.id + ".card"] || known[0] || "04A31FB2", spellcheck: "false",
+      "aria-label": t("dash.card.sim"), title: t("dash.card.sim"), oninput: e => { TILE_ARG[c.id + ".card"] = e.target.value; } });
+    out.push(h("div", { class: "inline cardsim" }, inp, h("button", { class: "btn sm", onclick: () => api("/api/sim", { board: c.board, pin: c.pin, value: inp.value }) }, t("dash.card.hold"))));
+  }
+  return out;
+}
+// NFC reader: the list of known cards, edited in the inspector.
+function cardsField(def, obj, comp) {
+  if (!Array.isArray(obj[def.key])) obj[def.key] = clone(def.default || []);
+  const list = obj[def.key], box = h("div", { class: "cards" });
+  const norm = x => String(x || "").replace(/[^0-9a-fA-F]/g, "").toUpperCase();
+  const last = (stOf(comp.id).card || null);
+  list.forEach((e, i) => box.append(h("div", { class: "cardrow" },
+    h("input", { type: "text", class: "uid", value: norm(e.uid), placeholder: "04A31FB2", spellcheck: "false", "aria-label": t("cards.uid"),
+      onchange: ev => { e.uid = norm(ev.target.value); ev.target.value = e.uid; changed(); } }),
+    h("input", { type: "text", value: e.name || "", placeholder: t("cards.name.ph"), "aria-label": t("cards.name"),
+      oninput: ev => { e.name = ev.target.value; changed(); } }),
+    h("button", { class: "btn sm cardx", title: t("cards.remove"), "aria-label": t("cards.remove"), onclick: () => { list.splice(i, 1); changed(); render(); } }, "×"))));
+  if (!list.length) box.append(h("p", { class: "small muted" }, t("cards.none")));
+  const have = last && list.some(e => norm(e.uid) === last.uid);
+  const acts = h("div", { class: "inline" });
+  if (last) acts.append(h("button", { class: "btn sm", disabled: have ? true : null, title: have ? t("cards.known_already") : null,
+    onclick: () => { list.push({ uid: last.uid, name: "" }); changed(); render(); } }, t("cards.add_last", last.uid)));
+  acts.append(h("button", { class: "btn sm ghost", onclick: () => { list.push({ uid: "", name: "" }); changed(); render(); } }, "+ " + t("cards.add")));
+  box.append(acts);
+  if (!last) box.append(h("p", { class: "small muted" }, t("cards.last_none")));
+  return h("div", {}, lab(t("prop." + def.key), "prop." + def.key + "." + comp.type, "prop." + def.key), box);
 }
 const FOCUSABLE = "button,input,select,textarea,a[href]";
 function redrawTile(id) {         // replaces one tile and keeps the keyboard focus on the same control
@@ -536,7 +590,7 @@ function pinCell(b, pid, reserved) {          // list view
   if (!pi) return null;
   const { p, c, res } = pi;
   return h("button", Object.assign({ class: pi.cls }, pi.attrs), h("span", { class: "pl" }, p.label), sockEl(c),
-    c || res ? null : h("span", { class: "caps" }, p.caps.map(k => h("i", { class: "f-" + k }))),
+    c || res ? null : h("span", { class: "caps" }, p.caps.filter(k => !QUIET_CAPS.includes(k)).map(k => h("i", { class: "f-" + k }))),
     h("span", { class: "nm" }, c ? c.name : res ? t("res." + res) : ""), c ? h("span", { class: "val" }, valText(c)) : null);
 }
 // The board drawing. Unit = one header pitch; data and rules: model.board (python/qh_boards.py).
@@ -586,7 +640,7 @@ function headerEls(pcb, b, hd, reserved, bd) {
     if (!pi) return;
     pcb.append(h("button", Object.assign({ class: pi.cls + " bpin " + lab + " " + flag, style }, pi.attrs),
       sockEl(pi.c), h("span", { class: "pl" }, pi.p.label),
-      pi.c || pi.res ? null : h("span", { class: "caps" }, pi.p.caps.map(k => h("i", { class: "f-" + k }))),
+      pi.c || pi.res ? null : h("span", { class: "caps" }, pi.p.caps.filter(k => !QUIET_CAPS.includes(k)).map(k => h("i", { class: "f-" + k }))),
       pi.c || pi.res ? h("span", { class: "fl" }, h("span", { class: "nm" }, pi.c ? pi.c.name : t("res." + pi.res)),
         pi.c ? h("span", { class: "val" }, valText(pi.c)) : null) : null));
   });
@@ -700,7 +754,7 @@ function viewBoards(m) {
   if (st.model && st.model !== b.model && META.models[st.model])
     left.append(h("div", { class: "note" }, t("boards.mismatch", META.models[st.model].label)));
   const drawn = !!model.board && lsGet("qhome.boardview", "board") !== "list";
-  const caps = [...new Set(model.pins.flatMap(p => p.caps))];
+  const caps = [...new Set(model.pins.flatMap(p => p.caps))].filter(k => !QUIET_CAPS.includes(k));
   const swatch = k => h("span", { class: "tag f-" + k, style: "min-width:14px;height:8px;padding:0" });
   left.append(h("div", { class: "viewbar" },
     h("div", { class: "legend" }, h("span", {}, t("boards.legend")), caps.map(k => h("span", {}, swatch(k), t("cap." + k))),
@@ -715,9 +769,9 @@ function viewBoards(m) {
     h("button", { class: "btn sm ghost", onclick: () => addComp("virtual_switch", null, null) }, "+ " + t("boards.virtual.add"))));
   m.append(h("div", { class: "boardgrid" }, left, h("div", { class: "panel inspector" }, inspector(b, reserved))));
 }
-function pinNotes(b, p) {
+function pinNotes(b, p, type) {    // type: the device on the pin; the servo-timer note only matters to a dimmer
   const model = modelOf(b);
-  const items = (p.notes || []).map(n => t("note." + n));
+  const items = (p.notes || []).filter(n => n !== "servo_timer" || !type || type === "pwm_output").map(n => t("note." + n));
   items.push(t(model.logic === 5 ? "note.logic5" : "note.logic33"));
   return h("ul", { class: "pinnotes" }, items.map(x => h("li", {}, x)));
 }
@@ -731,6 +785,7 @@ function optLabel(def, o, type) { // names of dropdown choices; matrix choices u
   return special ? tOr(special + o, o) : tOr("opt." + def.key + "." + o, o || t("none"));
 }
 function field(def, obj, type, rerender, self) {
+  if (def.type === "cards") return cardsField(def, obj, self);
   const v = obj[def.key] ?? def.default;
   const label = tOr("prop." + def.key + "." + type, t("prop." + def.key));
   const hints = ["prop." + def.key + "." + type, "prop." + def.key];
@@ -794,7 +849,7 @@ function inspector(b, reserved) {
     if (def.show) { const [k, want] = def.show.split("="); if (!String(want).split("|").includes(String(pr[k]))) continue; }
     f.append(field(def, c.props, c.type, ty.props.some(x => x.show && x.show.startsWith(def.key + "=")), c));
   }
-  if (p) f.append(pinNotes(cb, p));
+  if (p) f.append(pinNotes(cb, p, c.type));
   f.append(h("div", { style: "margin-top:16px;display:flex;gap:8px" }, h("button", { class: "btn danger", onclick: () => removeComp(c.id) }, t("remove")),
     h("button", { class: "btn", onclick: () => { SEL = null; render(); } }, t("close"))));
   return [f];
@@ -1217,6 +1272,7 @@ function applyLive(newLogs) {
   else if (VIEW === "log" && newLogs) render();
 }
 let lastBoards = "";
+const SCANS = {};                 // reader id -> time of the last card it read
 async function poll() {
   try {
     const s = await api("/api/state?log=" + LOGSEQ);
@@ -1233,6 +1289,13 @@ async function poll() {
       + JSON.stringify(s.discovered || []) + JSON.stringify(s.mx || {}) + JSON.stringify(s.matrix || {});
     const fresh = !ST || ST.rev !== s.rev || boardsNow !== lastBoards;
     lastBoards = boardsNow;
+    for (const c of (CFG ? CFG.components : []).filter(x => x.type === "nfc_reader")) {   // a card was read: say so on every page
+      const card = (s.states[c.id] || {}).card;
+      if (!card) continue;
+      if (ST && SCANS[c.id] !== undefined && SCANS[c.id] !== card.t)
+        toast(card.known ? t("toast.card.known", c.name || c.id, card.name || card.uid) : t("toast.card.unknown", c.name || c.id, card.uid));
+      SCANS[c.id] = card.t;
+    }
     ST = s;
     if (s.time && typeof s.time.epoch === "number") SKEW = s.time.epoch * 1000 - Date.now();
     if (fresh || s.logs.length) applyLive(s.logs.length);

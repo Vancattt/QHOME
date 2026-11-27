@@ -51,6 +51,9 @@ PROPS = {
     "led_matrix": {"brightness", "mode", "startup_text", "source", "bar_style", "bar_min", "bar_max",
                    "graph_secs", "anim", "speed", "icon", "clock_12h", "scroll_ms"},
     "virtual_switch": {"restore"},
+    "servo": {"open_angle", "closed_angle", "restore"},
+    "dht_sensor": {"model", "interval", "temp_offset", "hum_offset", "decimals"},
+    "nfc_reader": {"cards"},
 }
 ANCHOR_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")

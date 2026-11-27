@@ -30,6 +30,12 @@ def prop_schema(p):
                 s[j] = p[k]
     elif p["type"] == "select":
         s = {"enum": p["options"]}
+    elif p["type"] == "cards":            # NFC reader: the cards it knows
+        s = {"type": "array", "maxItems": qh_engine.MAX_CARDS, "items": {
+            "type": "object", "required": ["uid"], "additionalProperties": False, "properties": {
+                "uid": {"type": "string", "pattern": "^[0-9A-Fa-f :-]{8,40}$",
+                        "description": "Card id as the reader shows it: 8, 14 or 20 hex digits"},
+                "name": {"type": "string"}}}}
     else:
         s = {"type": "string"}
     s["default"] = p["default"]

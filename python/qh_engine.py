@@ -21,11 +21,12 @@ import qh_link
 import qh_script
 import qh_sys
 import qh_tz
-from qh_hw import (M_ADC, M_CNT, M_DAC, M_DIN, M_DIN_PD, M_DIN_PU, M_DOUT, M_OFF, M_PWM,
+from qh_hw import (M_ADC, M_CNT, M_DAC, M_DHT, M_DIN, M_DIN_PD, M_DIN_PU, M_DOUT, M_NFC, M_OFF,
+                   M_PWM, M_SERVO, UID_RE,
                    HELLO_RE, RGB_BITS, QLinkHW)
 from qh_mqtt import topic_match
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 LINK_PORT = 7001
 
 _DC_BIN = ["", "door", "window", "garage_door", "motion", "occupancy", "presence", "opening",
@@ -97,9 +98,22 @@ TYPES = {
         _n("scroll_ms", 120, 40, 1000, show="mode=text|value|status|ip")]},
     "virtual_switch": {"cap": None, "tag": "VS", "kind": "out", "ha": "switch", "props": [
         _s("restore", "restore", _RESTORE)]},
+    # Satellite boards only (qh_boards: caps servo / dht / nfc)
+    "servo": {"cap": "servo", "tag": "SRV", "kind": "out", "ha": "number", "props": [
+        _n("open_angle", 90, 0, 180), _n("closed_angle", 0, 0, 180),
+        _s("restore", "closed", ["closed", "open", "restore"])]},
+    "dht_sensor": {"cap": "dht", "tag": "TH", "kind": "in", "ha": "sensor", "props": [
+        _s("model", "dht22", ["dht22", "dht11"]), _n("interval", 5000, 2000, 60000),
+        _n("temp_offset", 0, -20, 20, step=0.1), _n("hum_offset", 0, -50, 50, step=1),
+        _n("decimals", 1, 0, 2)]},
+    "nfc_reader": {"cap": "nfc", "tag": "NFC", "kind": "in", "ha": "sensor", "props": [
+        {"key": "cards", "type": "cards", "default": []}]},
 }
+SERVO_TYPES = ("servo",)
+MAX_CARDS = 50
 BOOL_TYPES = ("binary_input", "switch_output", "virtual_switch")
-OUTPUT_TYPES = ("switch_output", "virtual_switch", "pwm_output", "dac_output", "rgb_led", "led_matrix")
+OUTPUT_TYPES = ("switch_output", "virtual_switch", "pwm_output", "dac_output", "rgb_led", "led_matrix",
+                "servo")
 # Outputs whose state is kept in state.json for "after a restart: as it was". Not the matrix: it
 # always starts from its setup, and its state string can change every second (a live value).
 SAVED_TYPES = tuple(t for t in OUTPUT_TYPES if t != "led_matrix")
@@ -132,6 +146,24 @@ DISCOVERED_MAX = 16      # boards that are there but not in the setup (Boards ta
 def props_of(comp):
     out = {p["key"]: p["default"] for p in TYPES[comp["type"]]["props"]}
     out.update(comp.get("props") or {})
+    return out
+
+
+def _angle(x):
+    return float(max(0, min(180, round(_num(x)))))
+
+
+def card_id(x):
+    """A card id as the reader reports it: hex digits, upper case ("04 a3:1f" -> "04A31F")."""
+    return re.sub(r"[^0-9A-Fa-f]", "", str(x or "")).upper()
+
+
+def cards_of(comp):
+    """{card id: name} of an NFC reader's known cards."""
+    out = {}
+    for e in props_of(comp).get("cards") or []:
+        if isinstance(e, dict) and card_id(e.get("uid")):
+            out[card_id(e.get("uid"))] = str(e.get("name") or "").strip()
     return out
 
 
@@ -272,13 +304,17 @@ def validate(cfg):
             continue
         if cap not in pin["caps"]:
             errs.append("%s: pin %s on %s cannot do that." % (name, pin["label"], b.get("name") or b["id"]))
-        if pin["id"] in qh_boards.reserved_pins(b, cfg.get("boards", [])):
-            errs.append("%s: pin %s is used by a board link and is not free." % (name, pin["label"]))
+        res = qh_boards.reserved_pins(b, cfg.get("boards", []), cfg.get("components", []))
+        if pin["id"] in res:
+            errs.append("%s: pin %s is %s and is not free." % (
+                name, pin["label"], "taken by the NFC reader (SPI)" if res[pin["id"]] == "nfc_spi"
+                else "used by a board link"))
         key = (b["id"], pin["id"])
         if key in used:
             errs.append("Pin %s on %s is used by both %s and %s."
                         % (pin["label"], b.get("name") or b["id"], used[key], cid))
         used[key] = cid
+    errs += _validate_parts(cfg, comps, boards)
     for cid, c in comps.items():
         if c["type"] != "led_matrix":
             continue
@@ -292,6 +328,47 @@ def validate(cfg):
             errs.append("%s: pick the device whose value the matrix shows." % (c.get("name") or cid))
     ws = (cfg.get("scripts") or {}).get("workspace") or {}
     errs += qh_script.validate(ws, comps, boards)
+    return errs
+
+
+def _validate_parts(cfg, comps, boards):
+    """Servo, DHT and NFC: how many fit on one board, and the NFC reader's card list."""
+    errs, per = [], {}
+    for c in comps.values():
+        if c["type"] in ("servo", "dht_sensor", "nfc_reader"):
+            per.setdefault((c.get("board"), c["type"]), []).append(c)
+    limits = {"servo": (qh_boards.MAX_SERVOS, "servos"), "dht_sensor": (qh_boards.MAX_DHT, "DHT sensors"),
+              "nfc_reader": (qh_boards.MAX_NFC, "NFC reader")}
+    for (bid, typ), lst in sorted(per.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+        b = boards.get(bid) or {}
+        lim, what = limits[typ]
+        if len(lst) > lim:
+            errs.append("%s: at most %d %s per board." % (b.get("name") or bid, lim, what))
+        if typ == "servo":
+            m = qh_boards.model(b.get("model")) or {}
+            clash = [x for x in comps.values() if x["type"] == "pwm_output" and x.get("board") == bid
+                     and x.get("pin") in m.get("servo_timer_pins", ())]
+            for x in clash:
+                errs.append("%s: dimming does not work on pin %s while a servo runs on the same board "
+                            "(the servo takes its timer). Use another pin for the dimmer."
+                            % (x.get("name") or x["id"], (m["pin_by_id"].get(x.get("pin")) or {}).get("label", x.get("pin"))))
+    for c in comps.values():
+        if c["type"] != "nfc_reader":
+            continue
+        cards = (c.get("props") or {}).get("cards", [])
+        name = c.get("name") or c["id"]
+        if not isinstance(cards, list) or len(cards) > MAX_CARDS:
+            errs.append("%s: the card list must be a list of at most %d cards." % (name, MAX_CARDS))
+            continue
+        seen = set()
+        for e in cards:
+            uid = card_id(e.get("uid") if isinstance(e, dict) else "")
+            if not UID_RE.match(uid):
+                errs.append("%s: card id '%s' is not valid (8, 14 or 20 hex digits)." % (
+                    name, (e.get("uid") if isinstance(e, dict) else e)))
+            elif uid in seen:
+                errs.append("%s: card %s is listed twice." % (name, uid))
+            seen.add(uid)
     return errs
 
 
@@ -546,6 +623,14 @@ class Engine:
             elif typ == "rgb_led":
                 saved = _TR_RGB.get(saved, saved)
                 v = saved if restore == "restore" and saved in RGB_BITS else "off"
+            elif typ == "servo":
+                closed, opened = _angle(p["closed_angle"]), _angle(p["open_angle"])
+                if restore == "restore" and saved is not None:
+                    v = _angle(saved)
+                else:
+                    v = opened if restore == "open" else closed
+            elif typ == "nfc_reader":
+                v = ""
             elif typ == "led_matrix":
                 v = ""
                 # over / temp: what a script, the dashboard or MQTT asked for (see matrix_show)
@@ -577,6 +662,13 @@ class Engine:
                 out[pin] = (M_PWM, 1000, 0)
             elif typ == "dac_output":
                 out[pin] = (M_DAC, 1000, 0)
+            elif typ == "servo":
+                out[pin] = (M_SERVO, 1000, 0)
+            elif typ == "dht_sensor":
+                kind = 11 if p["model"] == "dht11" else 22
+                out[pin] = (M_DHT, int(max(2000, min(60000, _num(p["interval"], 5000)))), kind)
+            elif typ == "nfc_reader":
+                out[pin] = (M_NFC, 150, 0)
         return out
 
     def apply_hw(self, bid, force=False):
@@ -631,6 +723,8 @@ class Engine:
             hw.write_analog(pin, int(round(max(0.0, min(vref, _num(v))) / vref * qh_boards.PWM_MAX)))
         elif typ == "rgb_led":
             hw.rgb(int(str(pin)[3:]), RGB_BITS.get(v, 0))
+        elif typ == "servo":
+            hw.write_analog(pin, int(_angle(v)))
 
     # ------------------------------------------------------------ state
     def state_of(self, cid):
@@ -661,7 +755,23 @@ class Engine:
             return ("%." + str(int(_num(props_of(c).get("decimals"), 2))) + "f") % v
         if typ == "dac_output":
             return "%.2f" % v
+        if typ == "servo":
+            return "%d" % round(v)
+        if typ == "dht_sensor":
+            return ("%." + str(int(_num(props_of(c).get("decimals"), 1))) + "f") % v
+        if typ == "nfc_reader":
+            return str(v) if v else "--"
         return str(v)
+
+    def humidity_of(self, cid):
+        return (self.aux.get(cid) or {}).get("hum")
+
+    def last_card(self, cid=None):
+        """The latest scan of one reader, or of any reader: {"uid", "name", "known", "t", "reader"}."""
+        if cid is not None:
+            return (self.aux.get(cid) or {}).get("card")
+        scans = [a["card"] for a in self.aux.values() if isinstance(a, dict) and a.get("card")]
+        return max(scans, key=lambda x: x["t"]) if scans else None
 
     def render_template(self, text):
         return re.sub(r"\{([a-z][a-z0-9_]*)\}", lambda m: self.fmt_value(m.group(1)), text or "")
@@ -690,6 +800,12 @@ class Engine:
         if c is None:
             return
         cid, typ, p = c["id"], c["type"], props_of(c)
+        if isinstance(raw, tuple):
+            if typ == "dht_sensor" and raw[0] == "dht":
+                self._dht_reading(c, p, raw[1], raw[2])
+            elif typ == "nfc_reader" and raw[0] == "nfc":
+                self._card_scanned(c, raw[1])
+            return
         if typ == "binary_input":
             self.set_state(cid, (raw == 1) != bool(p["invert"]))
         elif typ == "analog_sensor":
@@ -730,6 +846,53 @@ class Engine:
                     diff = raw - a["last"] if raw >= a["last"] else raw
                     self.set_state(cid, round(diff / (now - a["t"]) * 60.0 * mult, d))
                 a["last"], a["t"] = raw, now
+
+    def _dht_reading(self, c, p, temp, hum):
+        cid = c["id"]
+        a = self.aux.setdefault(cid, {})
+        if temp is None:                           # the sensor did not answer this time
+            a["errors"] = a.get("errors", 0) + 1
+            if a["errors"] == 3:
+                self.log("%s does not answer. Check its wiring and the DHT model in its settings."
+                         % (c.get("name") or cid), "warn")
+                a["hum"] = None
+                self.set_state(cid, None)
+            return
+        if a.get("errors", 0) >= 3:
+            self.log("%s answers again" % (c.get("name") or cid))
+        a["errors"] = 0
+        d = int(_num(p["decimals"], 1))
+        t = round(temp + _num(p["temp_offset"]), d)
+        h = round(max(0.0, min(100.0, hum + _num(p["hum_offset"]))), d)
+        old_h, a["hum"] = a.get("hum"), h
+        if t != self.state.get(cid):
+            self.set_state(cid, t)
+        elif h != old_h:                           # only the humidity moved
+            with self.lock:
+                self.stamp[cid] = time.time()
+                self.rev += 1
+            self._mqtt_state(c)
+            self.scripts.on_state(cid, t, t)
+
+    def _card_scanned(self, c, uid):
+        cid, now = c["id"], time.time()
+        cards = cards_of(c)
+        known = uid in cards
+        name = cards.get(uid, "")
+        scan = {"uid": uid, "name": name, "known": known, "t": now, "reader": cid}
+        a = self.aux.setdefault(cid, {})
+        a["card"] = scan
+        a["scans"] = (a.get("scans") or [])[-9:] + [scan]
+        where = c.get("name") or cid
+        if known:
+            self.log("Card '%s' (%s) scanned on %s" % (name or uid, uid, where))
+        else:
+            self.log("Unknown card %s scanned on %s" % (uid, where), "warn")
+        self.set_state(cid, (name or uid) if known else uid, force=True)
+        if self.mqtt and self.mqtt.mode != "off":
+            self.mqtt.publish("%s/%s/scan" % (self.node(), cid), json.dumps(
+                {"uid": uid, "name": name, "known": known}, ensure_ascii=False))
+        self.scripts.on_card(cid, scan)
 
     # ------------------------------------------------------------ commands
     def command(self, cid, action, value=None):
@@ -784,6 +947,23 @@ class Engine:
         elif typ == "led_matrix":
             self._matrix_cmd(c, action, value)
             return
+        elif typ == "servo":
+            p = props_of(c)
+            opened, closed = _angle(p["open_angle"]), _angle(p["closed_angle"])
+            word = str(value).strip().lower() if value is not None else ""
+            if action == "set" and word in ("open", "on", "close", "closed", "off", "toggle"):
+                action = {"on": "open", "off": "close", "closed": "close"}.get(word, word)
+            if action in ("on", "open"):
+                new = opened
+            elif action in ("off", "close"):
+                new = closed
+            elif action == "toggle":
+                new = closed if cur == opened else opened
+            elif action == "set":
+                new = _angle(value)
+            else:
+                new = cur
+            self.set_state(cid, new)
         else:
             self.log("'%s' is an input and cannot be switched" % cid, "warn")
             return
@@ -983,6 +1163,11 @@ class Engine:
             mode = (self.mx.get(c["id"]) or {}).get("mode")
             if mode:
                 self.mqtt.publish(base + "/mode", mode, retain=True)
+        elif c["type"] == "dht_sensor":
+            h = self.humidity_of(c["id"])
+            if h is not None:
+                self.mqtt.publish(base + "/humidity", ("%." + str(int(_num(props_of(c).get("decimals"), 1)))
+                                                       + "f") % h, retain=True)
 
     def _mqtt_board(self, bid):
         if self.mqtt and self.mqtt.mode != "off":
@@ -1032,9 +1217,26 @@ class Engine:
                     d.update(command_topic=base + "/set", options=list(RGB_BITS))
                 elif typ == "led_matrix":
                     d.update(command_topic=base + "/set", max=100, mode="text")
+                elif typ == "servo":
+                    d.update(command_topic=base + "/set", min=0, max=180, step=1, mode="slider",
+                             unit_of_measurement="°")
+                elif typ == "dht_sensor":
+                    d.update(device_class="temperature", unit_of_measurement="°C", state_class="measurement",
+                             suggested_display_precision=int(_num(p.get("decimals"), 1)))
+                elif typ == "nfc_reader":
+                    d.update(icon="mdi:nfc-variant", json_attributes_topic=base + "/scan")
                 topic = "%s/%s/%s/%s/config" % (prefix, comp, node, cid)
                 new_topics.add(topic)
                 self.mqtt.publish(topic, json.dumps(d, ensure_ascii=False), retain=True)
+                if typ == "dht_sensor":            # second entity: the humidity
+                    topic = "%s/sensor/%s/%s_humidity/config" % (prefix, node, cid)
+                    new_topics.add(topic)
+                    self.mqtt.publish(topic, json.dumps({
+                        "name": "%s humidity" % (c.get("name") or cid), "unique_id": "%s_%s_humidity" % (node, cid),
+                        "availability_topic": avail, "device": dev, "state_topic": base + "/humidity",
+                        "device_class": "humidity", "unit_of_measurement": "%", "state_class": "measurement",
+                        "suggested_display_precision": int(_num(p.get("decimals"), 1))},
+                        ensure_ascii=False), retain=True)
                 if typ == "led_matrix":            # second entity: what the matrix shows
                     topic = "%s/select/%s/%s_mode/config" % (prefix, node, cid)
                     new_topics.add(topic)
@@ -1286,6 +1488,12 @@ class Engine:
         with self.lock:
             st = {c["id"]: {"v": self.state.get(c["id"]), "txt": self.fmt_value(c["id"]),
                             "t": self.stamp.get(c["id"])} for c in self.cfg["components"]}
+            for c in self.cfg["components"]:
+                a = self.aux.get(c["id"]) or {}
+                if c["type"] == "dht_sensor":
+                    st[c["id"]]["h"] = a.get("hum")
+                elif c["type"] == "nfc_reader":
+                    st[c["id"]]["card"] = dict(a["card"]) if a.get("card") else None
             boards = {}
             for b in self.cfg["boards"]:
                 bid, hw, tr = b["id"], self.hws.get(b["id"]), self.transports.get(b["id"])

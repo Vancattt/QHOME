@@ -2,6 +2,8 @@
 // a PC (tests/test_firmware.py). stdin carries the serial link; lines starting with '~'
 // are test controls:  "~d <pin> <0|1>" input level, "~a <pin> <value>" ADC value,
 // "~i <pin> <count>" fire the pin's interrupt, "~w <0|1>" Wi-Fi up / lost, "~q" quit.
+// "~h <pin> <t x10> <h x10>" puts a DHT sensor on a pin (t x10 = -1000: it does not answer),
+// "~n <card id hex>" holds an NFC card to the RC522 (libs/MFRC522.h).
 // Output writes are reported on stderr:  PM pinMode, DW digitalWrite, AW analogWrite,
 // DA dacWrite, DD dacDisable, WB WiFi.begin, and "XX ..." when the sketch touches a pin that
 // would crash the real chip (flash pins of the ESP boards).
@@ -92,6 +94,17 @@ typedef uint8_t byte;
   #define digitalPinHasPWM(p) ((p) == 3 || (p) == 5 || (p) == 6 || (p) == 9 || (p) == 10 || (p) == 11)
   #define digitalPinToInterrupt(p) ((p) == 2 ? 0 : ((p) == 3 ? 1 : NOT_AN_INTERRUPT))
 #endif
+#if defined(ARDUINO_ARCH_ESP32) && CONFIG_IDF_TARGET_ESP32C3
+static const uint8_t MOSI = 6, MISO = 5, SCK = 4;
+#elif defined(ARDUINO_ARCH_ESP32)
+static const uint8_t MOSI = 23, MISO = 19, SCK = 18;
+#elif defined(ARDUINO_ARCH_ESP8266)
+static const uint8_t MOSI = 13, MISO = 12, SCK = 14;
+#elif defined(__AVR_ATmega2560__)
+static const uint8_t MOSI = 51, MISO = 50, SCK = 52;
+#else
+static const uint8_t MOSI = 11, MISO = 12, SCK = 13;
+#endif
 #ifndef MOCK_ESP
   #define A1 (A0 + 1)
   #define A2 (A0 + 2)
@@ -117,6 +130,7 @@ inline int mockPinLedc[MOCK_NPIN];  // channel + 1 that drives the pin right now
 inline int mockLevel[MOCK_NPIN], mockAnalog[MOCK_NPIN];
 inline void (*mockIsr[MOCK_NPIN])();   // indexed by interrupt number (on ESP that is the GPIO number)
 inline std::string mockRx;          // link bytes waiting for the sketch
+inline std::string mockCard;        // "~n": card id waiting at the NFC reader
 inline int mockWifiLost;            // "~w 0": the access point is gone until the sketch joins again
 inline void (*mockCtl)(const std::string &);   // extra '~' controls of a test harness
 inline void mockBad(const char *what, int p) { if (MOCK_FORBIDDEN(p)) fprintf(stderr, "XX %s %d\n", what, p); }
@@ -126,17 +140,62 @@ inline uint32_t millis() {
   static auto t0 = steady_clock::now();
   return (uint32_t)duration_cast<milliseconds>(steady_clock::now() - t0).count();
 }
-inline uint32_t micros() { return millis() * 1000u; }
+// DHT sensor emulation. While a sensor sends its 40 bits, time is virtual: micros() stands still
+// except that every digitalRead() of that pin takes 2 us and delayMicroseconds() its argument,
+// so the sketch's pulse timing sees the waveform exactly as the real sensor draws it.
+inline int mockDhtT[MOCK_NPIN], mockDhtH[MOCK_NPIN];
+inline bool mockDhtOn[MOCK_NPIN];
+inline int mockDhtPin = -1;                 // the sensor that is talking right now
+inline uint32_t mockDhtUs;                  // virtual microseconds since it was released
+inline uint32_t mockDhtBase;                // micros() when it started
+inline int mockDhtLowSince[MOCK_NPIN];      // millis() + 1 when the sketch pulled the line low
+inline int mockDhtLevel(int p, uint32_t us) {
+  if (mockDhtT[p] <= -1000) return 1;      // a sensor that does not answer: the pull-up wins
+  int t = mockDhtT[p], h = mockDhtH[p];
+  uint8_t d[5];
+  uint16_t tt = (uint16_t)(t < 0 ? (0x8000 | (uint16_t)(-t)) : t);
+  d[0] = (uint8_t)(h >> 8); d[1] = (uint8_t)h; d[2] = (uint8_t)(tt >> 8); d[3] = (uint8_t)tt;
+  d[4] = (uint8_t)(d[0] + d[1] + d[2] + d[3]);
+  uint32_t edge = 30;                       // released line rises, then the sensor answers
+  if (us < edge) return 1;
+  if (us < (edge += 80)) return 0;
+  if (us < (edge += 80)) return 1;
+  for (int i = 0; i < 40; i++) {
+    if (us < (edge += 50)) return 0;
+    int one = (d[i / 8] >> (7 - i % 8)) & 1;
+    if (us < (edge += one ? 70 : 27)) return 1;
+  }
+  if (us < edge + 50) return 0;
+  mockDhtPin = -1;                          // done: back to real time
+  return 1;
+}
+inline uint32_t micros() {
+  if (mockDhtPin >= 0) return mockDhtBase + mockDhtUs;
+  return millis() * 1000u;
+}
 inline void delay(uint32_t ms) { usleep(ms * 1000); }
+inline void delayMicroseconds(uint32_t us) { if (mockDhtPin >= 0) mockDhtUs += us; else usleep(us); }
 inline void pinMode(int p, int m) {
   mockBad("pinMode", p); fprintf(stderr, "PM %d %d\n", p, m);
+  if (p >= 0 && p < MOCK_NPIN && mockDhtOn[p] && m != OUTPUT && mockDhtLowSince[p]) {
+    int held = (int)millis() + 1 - mockDhtLowSince[p];
+    mockDhtLowSince[p] = 0;
+    if (held >= 1) { mockDhtBase = millis() * 1000u; mockDhtUs = 0; mockDhtPin = p; }   // start signal seen
+  }
   if (m == INPUT_PULLUP && p < MOCK_NPIN && mockLevel[p] < 0) mockLevel[p] = 1;
 #ifdef MOCK_LEDC2
   if (p >= 0 && p < MOCK_NPIN) mockPinLedc[p] = 0;          // gpio_config() makes it a plain GPIO again
 #endif
 }
-inline void digitalWrite(int p, int v) { mockBad("digitalWrite", p); fprintf(stderr, "DW %d %d\n", p, v); }
-inline int digitalRead(int p) { return (p >= 0 && p < MOCK_NPIN && mockLevel[p] > 0) ? 1 : 0; }
+inline void digitalWrite(int p, int v) {
+  mockBad("digitalWrite", p);
+  if (p >= 0 && p < MOCK_NPIN && mockDhtOn[p]) { if (v == 0) mockDhtLowSince[p] = (int)millis() + 1; return; }
+  fprintf(stderr, "DW %d %d\n", p, v);
+}
+inline int digitalRead(int p) {
+  if (p >= 0 && p == mockDhtPin) { mockDhtUs += 2; return mockDhtLevel(p, mockDhtUs); }
+  return (p >= 0 && p < MOCK_NPIN && mockLevel[p] > 0) ? 1 : 0;
+}
 inline int analogRead(int p) { return (p >= 0 && p < MOCK_NPIN) ? mockAnalog[p] : 0; }
 #ifdef MOCK_LEDC2
 // esp32 core 2.x. analogWrite() there keeps a pin's channel until reset and (2.0.0-2.0.8) does not
@@ -204,6 +263,11 @@ inline void mockPump() {
         if (k == 'a' && p < MOCK_NPIN) mockAnalog[p] = (int)v;
         if (k == 'i') { int irq = digitalPinToInterrupt(p); for (long c = 0; c < v; c++) if (irq >= 0 && irq < MOCK_NPIN && mockIsr[irq]) mockIsr[irq](); }
         if (k == 'w') mockWifiLost = (p == 0);
+        if (k == 'h' && p >= 0 && p < MOCK_NPIN) {
+          long h = 0; sscanf(line.c_str() + 2, "%d %ld %ld", &p, &v, &h);
+          mockDhtOn[p] = true; mockDhtT[p] = (int)v; mockDhtH[p] = (int)h;
+        }
+        if (k == 'n') { char id[32] = { 0 }; sscanf(line.c_str() + 2, "%31s", id); mockCard = id; }
         if (k == 'q') exit(0);
         if (mockCtl) mockCtl(line);
       } else mockRx += line;
